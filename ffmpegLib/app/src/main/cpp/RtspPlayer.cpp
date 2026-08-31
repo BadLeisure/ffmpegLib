@@ -145,6 +145,13 @@ int64_t RtspPlayer::nowMonotonicUs() {
     return av_gettime_relative();
 }
 
+int64_t RtspPlayer::elapsedMsFromUs(int64_t baseUs, int64_t pointUs) {
+    if (baseUs <= 0 || pointUs <= 0 || pointUs < baseUs) {
+        return -1;
+    }
+    return (pointUs - baseUs) / 1000;
+}
+
 void RtspPlayer::armInterruptTimeout(int64_t timeoutUs) {
     if (timeoutUs <= 0) {
         interruptDeadlineUs_.store(0);
@@ -184,6 +191,52 @@ int RtspPlayer::ffmpegInterruptCallback(void* opaque) {
              static_cast<long long>(RtspPlayer::nowMonotonicUs()));
     }
     return shouldStop ? 1 : 0;
+}
+
+void RtspPlayer::resetSwitchTraceLocked() {
+    activeSwitchId_.store(0);
+    switchRequestUs_.store(0);
+    switchCleanupUs_.store(0);
+    switchOpenInputUs_.store(0);
+    switchFindStreamInfoUs_.store(0);
+    switchRefreshThreadUs_.store(0);
+    switchFirstKeyUs_.store(0);
+    switchFirstFrameUs_.store(0);
+    switchTraceActive_.store(false);
+    switchFirstFrameLogged_.store(false);
+}
+
+void RtspPlayer::beginSwitchTraceLocked() {
+    activeSwitchId_.store(nextSwitchId_.fetch_add(1));
+    switchRequestUs_.store(nowMonotonicUs());
+    switchCleanupUs_.store(0);
+    switchOpenInputUs_.store(0);
+    switchFindStreamInfoUs_.store(0);
+    switchRefreshThreadUs_.store(0);
+    switchFirstKeyUs_.store(0);
+    switchFirstFrameUs_.store(0);
+    switchTraceActive_.store(true);
+    switchFirstFrameLogged_.store(false);
+}
+
+void RtspPlayer::logSwitchTrace(const char* eventName, int64_t /* eventUs */) {
+    if (!switchTraceActive_.load()) {
+        return;
+    }
+
+    const int64_t switchId = activeSwitchId_.load();
+    const int64_t requestUs = switchRequestUs_.load();
+
+    LOGD_PLAYER(playerId_,
+         "switch_trace switch_id=%lld event=%s cleanup_ms=%lld open_input_ms=%lld find_stream_info_ms=%lld refresh_thread_ms=%lld first_key_ms=%lld first_frame_ms=%lld",
+         static_cast<long long>(switchId),
+         eventName ? eventName : "unknown",
+         static_cast<long long>(elapsedMsFromUs(requestUs, switchCleanupUs_.load())),
+         static_cast<long long>(elapsedMsFromUs(requestUs, switchOpenInputUs_.load())),
+         static_cast<long long>(elapsedMsFromUs(requestUs, switchFindStreamInfoUs_.load())),
+         static_cast<long long>(elapsedMsFromUs(requestUs, switchRefreshThreadUs_.load())),
+         static_cast<long long>(elapsedMsFromUs(requestUs, switchFirstKeyUs_.load())),
+         static_cast<long long>(elapsedMsFromUs(requestUs, switchFirstFrameUs_.load())));
 }
 
 namespace {
@@ -320,12 +373,16 @@ void RtspPlayer::start(const std::string& url) {
                 LOGD_PLAYER(playerId_, "start ignored because url is already playing");
                 return;
             }
+            beginSwitchTraceLocked();
+            logSwitchTrace("request", switchRequestUs_.load());
             LOGD_PLAYER(playerId_, "start new url=%s", url.c_str());
             pendingRtspUrl_ = url;
             hasPendingRtspUrl_ = true;
             shouldRequestStop = true;
             //说明上一次 stopPlayer() 已经发出去了，但旧线程还在清理中，还没完全回到 Idle。这时再调用 start(newUrl)，就是“清理中的再次切流
         } else if (currentState == PlayerState::Stopping) {
+            beginSwitchTraceLocked();
+            logSwitchTrace("request", switchRequestUs_.load());
             pendingRtspUrl_ = url;
             hasPendingRtspUrl_ = true;
             LOGD_PLAYER(playerId_, "start saved pending url while player is stopping");
@@ -444,6 +501,11 @@ int RtspPlayer::handleFrame(const AVFrame* frame, double ptsSeconds) {
         return -1;
     }
     jobject byteBuffer = frameBuffer_->getDirectByteBuffer(env);
+    if (switchTraceActive_.load() && !switchFirstFrameLogged_.exchange(true)) {
+        const int64_t firstFrameUs = nowMonotonicUs();
+        switchFirstFrameUs_.store(firstFrameUs);
+        logSwitchTrace("first_frame", firstFrameUs);
+    }
     env->CallVoidMethod(callbackGlobalRef_, onI420DataMethod_, byteBuffer, frame->width, frame->height, ptsSeconds);
     if (byteBuffer) {
         env->DeleteLocalRef(byteBuffer);
@@ -471,7 +533,13 @@ void RtspPlayer::readThreadLoop() {
         LOGD_PLAYER(playerId_, "readThreadLoop finishing");
         std::lock_guard<std::mutex> lock(stateMutex_);
         releaseOwnedResources();
+        if (switchTraceActive_.load()) {
+            const int64_t cleanupUs = nowMonotonicUs();
+            switchCleanupUs_.store(cleanupUs);
+            logSwitchTrace("cleanup_done", cleanupUs);
+        }
         if (!hasPendingRtspUrl_) {
+            resetSwitchTraceLocked();
             return false;
         }
 
@@ -524,6 +592,11 @@ void RtspPlayer::readThreadLoop() {
                         state = ReadState::WaitRetry;
                         break;
                     }
+                    if (switchTraceActive_.load()) {
+                        const int64_t openInputUs = nowMonotonicUs();
+                        switchOpenInputUs_.store(openInputUs);
+                        logSwitchTrace("open_input_done", openInputUs);
+                    }
                     armInterruptTimeout(kConnectInterruptTimeoutUs);
                     ret = avformat_find_stream_info(fmtCtx, nullptr);
                     clearInterruptTimeout(); 
@@ -533,6 +606,11 @@ void RtspPlayer::readThreadLoop() {
                         retryReason = RetryReason::ConnectFailure;
                         state = ReadState::WaitRetry;
                         break;
+                    }
+                    if (switchTraceActive_.load()) {
+                        const int64_t findStreamInfoUs = nowMonotonicUs();
+                        switchFindStreamInfoUs_.store(findStreamInfoUs);
+                        logSwitchTrace("find_stream_info_done", findStreamInfoUs);
                     }
 
                     videoStreamIndex = -1;
@@ -733,6 +811,11 @@ ReadExitReason RtspPlayer::readPacketLoop(AVFormatContext* fmtCtx, int videoStre
             if (waitVideoKeyFrame) {
                 waitVideoKeyFrame = false;
                 LOGD_PLAYER(playerId_, "recv first key packet, start feeding decoder");
+                if (switchTraceActive_.load()) {
+                    const int64_t firstKeyUs = nowMonotonicUs();
+                    switchFirstKeyUs_.store(firstKeyUs);
+                    logSwitchTrace("first_key", firstKeyUs);
+                }
             }
             extractHevcSeiAndCallback(pkt->data, pkt->size);
             packet_queue_put(&videoQueue_, pkt);
@@ -826,6 +909,11 @@ int RtspPlayer::streamComponentOpen(int streamIndex, AVFormatContext* fmtCtx) {
         videoDecoder_.decoder_init(avctx, &videoQueue_, &frameQueue_);
         videoDecoder_.decoder_start("video_thread");
         videoDecoder_.refresh_start("refresh_thread", &frameQueue_);
+        if (switchTraceActive_.load()) {
+            const int64_t refreshThreadUs = nowMonotonicUs();
+            switchRefreshThreadUs_.store(refreshThreadUs);
+            logSwitchTrace("refresh_thread_start", refreshThreadUs);
+        }
     }
 
     return 0;

@@ -54,10 +54,14 @@ private:
 
     //添加打断
     static int64_t nowMonotonicUs();
+    static int64_t elapsedMsFromUs(int64_t baseUs, int64_t pointUs);
     void armInterruptTimeout(int64_t timeoutUs);
     void clearInterruptTimeout();
     bool shouldInterrupt() const;
     static int ffmpegInterruptCallback(void* opaque);
+    void resetSwitchTraceLocked();
+    void beginSwitchTraceLocked();
+    void logSwitchTrace(const char* eventName, int64_t eventUs);
 
     void notifyJavaError(int errorCode);
     void notifySeiToJava(const uint8_t* sei, int size);
@@ -114,6 +118,28 @@ private:
     int readRetryCount_ = 0;
 
     std::atomic<int64_t> interruptDeadlineUs_{0};
-    std::atomic<int64_t> lastVideoPacketRecvUs_{0};
+    std::atomic<int64_t> lastVideoPacketRecvUs_{0};q
     std::atomic<bool> videoPacketTimeoutWarned_{false};
+    // 单调递增的切流编号，方便把同一次切流的多条日志串起来看。
+    std::atomic<int64_t> nextSwitchId_{1};
+    // 当前正在追踪的切流编号；为 0 表示当前没有切流追踪任务。
+    std::atomic<int64_t> activeSwitchId_{0};
+    // start(newUrl) 发起切流请求的时间戳，作为整次切流耗时计算的基准点。
+    std::atomic<int64_t> switchRequestUs_{0};
+    // 旧流清理完成的时间戳，对应“旧线程退出/旧解码器销毁完”的阶段。
+    std::atomic<int64_t> switchCleanupUs_{0};
+    // avformat_open_input 成功返回的时间戳，对应“新流建连完成”的阶段。
+    std::atomic<int64_t> switchOpenInputUs_{0};
+    // avformat_find_stream_info 成功返回的时间戳，对应“流信息探测完成”的阶段。
+    std::atomic<int64_t> switchFindStreamInfoUs_{0};
+    // refresh_start 调用完成的时间戳，用来观察刷新线程拉起是否耗时明显。
+    std::atomic<int64_t> switchRefreshThreadUs_{0};
+    // readPacketLoop 收到新流首个关键帧包的时间戳，用来判断是否卡在等关键帧。
+    std::atomic<int64_t> switchFirstKeyUs_{0};
+    // native 首次把新流画面通过 onI420Data 回调给 Java 的时间戳。
+    std::atomic<int64_t> switchFirstFrameUs_{0};
+    // 当前是否处于切流耗时追踪中，避免普通首次播放或普通 stop 误打 switch_trace。
+    std::atomic<bool> switchTraceActive_{false};
+    // 保证同一次切流只记录一次 first_frame，避免每帧都重复打印。
+    std::atomic<bool> switchFirstFrameLogged_{false};
 };
