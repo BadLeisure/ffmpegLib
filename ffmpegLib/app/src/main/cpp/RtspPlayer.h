@@ -45,6 +45,12 @@ private:
     void readThreadLoop();
     ReadExitReason readPacketLoop(AVFormatContext* fmtCtx, int videoStreamIndex);
     void resetHevcGateState();
+    // 为当前流准备一个常驻可复用的解码器。
+    // 后续会把 streamComponentOpen() 里的实现逐步挪到这里。
+    int ensureDecoderForStream(AVFormatContext* fmtCtx, int streamIndex);
+    // 判断当前解码器是否还能复用到新流。
+    bool canReuseDecoderForStream(AVFormatContext* fmtCtx, int streamIndex) const;
+
     bool waitRetryInterruptible(std::chrono::milliseconds delay);
     std::chrono::milliseconds nextRetryDelay(RetryReason reason);
     void resetRetryBackoff();
@@ -52,7 +58,7 @@ private:
     int initDecoderWithFallback(AVFormatContext* fmtCtx, int streamIndex, AVCodecContext** avctx, int* useHw);
     int streamComponentOpen(int streamIndex, AVFormatContext* fmtCtx);
 
-    //添加打断
+    // 添加打断
     static int64_t nowMonotonicUs();
     static int64_t elapsedMsFromUs(int64_t baseUs, int64_t pointUs);
     void armInterruptTimeout(int64_t timeoutUs);
@@ -97,8 +103,11 @@ private:
     std::atomic<bool> threadRunning_{false};
     std::atomic<PlayerState> state_{PlayerState::Idle};
 
+    // 每次切流都会重建这两条队列。
+    // 播放器创建时初始化，切流时只清空并复用。
     PacketQueue videoQueue_{};
     FrameQueue frameQueue_{};
+    // 当前仍按播放周期管理解码器，后续会逐步改成常驻生命周期。
     Decoder videoDecoder_{};
 
     int isRealtime_ = 0;
@@ -118,13 +127,13 @@ private:
     int readRetryCount_ = 0;
 
     std::atomic<int64_t> interruptDeadlineUs_{0};
-    std::atomic<int64_t> lastVideoPacketRecvUs_{0};q
+    std::atomic<int64_t> lastVideoPacketRecvUs_{0};
     std::atomic<bool> videoPacketTimeoutWarned_{false};
-    // 单调递增的切流编号，方便把同一次切流的多条日志串起来看。
+    // 单调递增的切流编号，用来把同一次切流的日志串起来看。
     std::atomic<int64_t> nextSwitchId_{1};
-    // 当前正在追踪的切流编号；为 0 表示当前没有切流追踪任务。
+    // 当前正在追踪的切流编号；为 0 表示没有切流追踪任务。
     std::atomic<int64_t> activeSwitchId_{0};
-    // start(newUrl) 发起切流请求的时间戳，作为整次切流耗时计算的基准点。
+    // 切流耗时分析的时间戳。
     std::atomic<int64_t> switchRequestUs_{0};
     // 旧流清理完成的时间戳，对应“旧线程退出/旧解码器销毁完”的阶段。
     std::atomic<int64_t> switchCleanupUs_{0};
@@ -138,8 +147,8 @@ private:
     std::atomic<int64_t> switchFirstKeyUs_{0};
     // native 首次把新流画面通过 onI420Data 回调给 Java 的时间戳。
     std::atomic<int64_t> switchFirstFrameUs_{0};
-    // 当前是否处于切流耗时追踪中，避免普通首次播放或普通 stop 误打 switch_trace。
+    // 只在切流过程中开启追踪。
     std::atomic<bool> switchTraceActive_{false};
-    // 保证同一次切流只记录一次 first_frame，避免每帧都重复打印。
+    // 保证同一次切流只记录一次 first_frame。
     std::atomic<bool> switchFirstFrameLogged_{false};
 };

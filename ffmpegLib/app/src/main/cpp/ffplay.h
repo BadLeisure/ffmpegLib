@@ -2,6 +2,8 @@
 #define FF_FFPLAY_H
 
 #include "ffplay_def.h"
+#include <atomic>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -30,8 +32,20 @@ public:
     std::thread *video_refresh_thread_ = NULL;
 
     std::function<int(const AVFrame*,double)> mVideoCallback;
+    std::mutex decoder_mutex_;
+    std::atomic<bool> switching_{false};
+    std::mutex output_mutex_;
+    int session_generation = -1;
 
     void decoder_abort();
+    // 切流时清空队列并刷新解码器，但不退出常驻线程。
+    void decoder_flush_for_switch();
+    // 切流或重新播放时重新绑定队列。
+    void decoder_rebind_queue(PacketQueue* queue, FrameQueue* frameQueue);
+    //判断解码线程 video_thread 是否存在
+    bool decoder_thread_running() const;
+    //判断刷新线程 video_refresh_thread 是否存在
+    bool refresh_thread_running() const;
 
     ~Decoder();
 

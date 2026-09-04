@@ -250,6 +250,8 @@ int RtspPlayer::nextPlayerId() {
 RtspPlayer::RtspPlayer(JavaVM* jvm) : jvm_(jvm), playerId_(nextPlayerId()) {
     videoQueue_.owner_player_id = playerId_;
     frameQueue_.owner_player_id = playerId_;
+    packet_queue_init(&videoQueue_);
+    frame_queue_init(&frameQueue_, VIDEO_PICTURE_QUEUE_SIZE);
     videoDecoder_.setOwnerPlayerId(playerId_);
     videoDecoder_.framePool_.owner_player_id = playerId_;
 }
@@ -314,6 +316,9 @@ RtspPlayer::~RtspPlayer() {
         // 2. 再彻底释放 frameBuffer_ 持有的双缓冲和 DirectByteBuffer 全局引用。
         releaseOwnedResources();
         frameBuffer_.reset();
+        videoDecoder_.decoder_destroy();
+        packet_queue_destroy(&videoQueue_);
+        frame_queue_destroy(&frameQueue_);
         // callback global ref 的生命周期跟 player 一致，由析构统一释放。
         if (env) {
             releaseCallbackRefs(env);
@@ -479,8 +484,16 @@ void RtspPlayer::requestStopInternal(bool clearPendingSwitch) {
     abortRequested_.store(true);
     retryCond_.notify_all();
     // 主动打断可能阻塞在队列上的解码/渲染线程，让它们尽快从 wait 中返回并退出。
-    packet_queue_abort(&videoQueue_);
-    frame_queue_abort(&frameQueue_);
+    if (clearPendingSwitch) {
+        // 真正停止或销毁时，终止解码和刷新线程，后续由 decoder_abort() 统一 join。
+        packet_queue_abort(&videoQueue_);
+        frame_queue_abort(&frameQueue_);
+    } else {
+        // 自动切流时保留解码和刷新线程常驻。
+        // 读包线程退出后，切流清理流程会 flush 队列并重新 start，
+        // 常驻线程继续等待新流的关键帧和视频帧。
+        LOGD_PLAYER(playerId_, "switch stop: keep decoder and refresh threads resident");
+    }
 }
 
 int RtspPlayer::handleFrame(const AVFrame* frame, double ptsSeconds) {
@@ -538,11 +551,15 @@ void RtspPlayer::readThreadLoop() {
             switchCleanupUs_.store(cleanupUs);
             logSwitchTrace("cleanup_done", cleanupUs);
         }
+        // 没有新 URL，表示真正停止
         if (!hasPendingRtspUrl_) {
+            videoDecoder_.decoder_abort();
             resetSwitchTraceLocked();
             return false;
         }
 
+        // 能走到这里，说明 hasPendingRtspUrl_ == true,表示这是切流，不是最终停止
+        videoDecoder_.decoder_flush_for_switch();
         rtspUrl_ = pendingRtspUrl_;
         pendingRtspUrl_.clear();
         hasPendingRtspUrl_ = false;
@@ -569,8 +586,6 @@ void RtspPlayer::readThreadLoop() {
                     fmtCtx->interrupt_callback.opaque = this;
                     LOGD_PLAYER(playerId_, "AVFormatContext interrupt callback attached");
 
-                    packet_queue_init(&videoQueue_);
-                    frame_queue_init(&frameQueue_, VIDEO_PICTURE_QUEUE_SIZE);
                     state = ReadState::Connecting;
                     break;
                 }
@@ -579,8 +594,8 @@ void RtspPlayer::readThreadLoop() {
                     AVDictionary* opts = nullptr;
                     av_dict_set(&opts, "rtsp_transport", "tcp", 0);
                     av_dict_set(&opts, "stimeout", "3000000", 0);
-                    av_dict_set(&opts, "probesize", "1024000", 0);      // 1MB
-                    av_dict_set(&opts, "analyzeduration", "400000", 0); // 400ms
+                    av_dict_set(&opts, "probesize", "512000", 0);      // 512KB
+                    av_dict_set(&opts, "analyzeduration", "300000", 0); // 300ms
 
                     armInterruptTimeout(kConnectInterruptTimeoutUs);
                     int ret = avformat_open_input(&fmtCtx, rtspUrl_.c_str(), nullptr, &opts);
@@ -836,6 +851,121 @@ void RtspPlayer::resetHevcGateState() {
     hevcSeenPps_ = false;
 }
 
+bool RtspPlayer::canReuseDecoderForStream(AVFormatContext* fmtCtx, int streamIndex) const {
+    if (!fmtCtx || streamIndex < 0 || streamIndex >= static_cast<int>(fmtCtx->nb_streams)) {
+        LOGD_PLAYER(playerId_, "decoder_reuse_check reject: invalid fmtCtx or streamIndex=%d", streamIndex);
+        return false;
+    }
+
+    const AVCodecContext* avctx = videoDecoder_.avctx_;
+    const AVStream* stream = fmtCtx->streams[streamIndex];
+    if (!avctx || !stream || !stream->codecpar) {
+        LOGD_PLAYER(playerId_, "decoder_reuse_check reject: avctx=%p stream=%p codecpar=%p",
+             avctx, stream, stream ? stream->codecpar : nullptr);
+        return false;
+    }
+
+    const AVCodecParameters* params = stream->codecpar;
+    if (avctx->codec_id != params->codec_id ||
+        avctx->codec_type != params->codec_type) {
+        LOGD_PLAYER(playerId_,
+             "decoder_reuse_check reject: codec mismatch avctx(codec_id=%d type=%d) stream(codec_id=%d type=%d)",
+             avctx->codec_id, avctx->codec_type, params->codec_id, params->codec_type);
+        return false;
+    }
+
+    if (params->width > 0 && avctx->width > 0 && params->width != avctx->width) {
+        LOGD_PLAYER(playerId_,
+             "decoder_reuse_check reject: width mismatch avctx=%d stream=%d",
+             avctx->width, params->width);
+        return false;
+    }
+    if (params->height > 0 && avctx->height > 0 && params->height != avctx->height) {
+        LOGD_PLAYER(playerId_,
+             "decoder_reuse_check reject: height mismatch avctx=%d stream=%d",
+             avctx->height, params->height);
+        return false;
+    }
+    if (params->extradata_size > 0 && avctx->extradata_size > 0) {
+        if (params->extradata_size != avctx->extradata_size ||
+            std::memcmp(params->extradata, avctx->extradata, params->extradata_size) != 0) {
+            LOGD_PLAYER(playerId_,
+                 "decoder_reuse_check reject: extradata mismatch avctx_size=%d stream_size=%d",
+                 avctx->extradata_size, params->extradata_size);
+            return false;
+        }
+    }
+
+    LOGD_PLAYER(playerId_,
+         "decoder_reuse_check accept: codec_id=%d type=%d width=%d height=%d",
+         params->codec_id, params->codec_type, params->width, params->height);
+    return true;
+}
+
+/**
+ * 如果 videoDecoder_ 里还没有 avctx_
+    -> 创建一个新的 AVCodecContext
+   如果 videoDecoder_ 里已经有 avctx_，并且新流参数一致
+    -> 继续复用这个 avctx_
+ */
+int RtspPlayer::ensureDecoderForStream(AVFormatContext* fmtCtx, int streamIndex) {
+    if (!fmtCtx || streamIndex < 0 || streamIndex >= static_cast<int>(fmtCtx->nb_streams)) {
+        LOGD_PLAYER(playerId_, "ensure_decoder reject: invalid fmtCtx or streamIndex=%d", streamIndex);
+        return AVERROR(EINVAL);
+    }
+
+    AVStream* stream = fmtCtx->streams[streamIndex];
+    if (!stream || !stream->codecpar) {
+        LOGD_PLAYER(playerId_, "ensure_decoder reject: stream=%p codecpar=%p",
+             stream, stream ? stream->codecpar : nullptr);
+        return AVERROR(EINVAL);
+    }
+
+    videoQueue_.owner_player_id = playerId_;
+    frameQueue_.owner_player_id = playerId_;
+    videoDecoder_.setOwnerPlayerId(playerId_);
+    videoDecoder_.framePool_.owner_player_id = playerId_;
+
+    //有旧 avctx，且参数兼容 -> 复用
+    if (videoDecoder_.avctx_ && canReuseDecoderForStream(fmtCtx, streamIndex)) {
+        LOGD_PLAYER(playerId_, "ensure_decoder reuse existing decoder");
+        videoDecoder_.time_base = stream->time_base;
+        //decoder_abort() 会把这两个指针清空，暂时看起来冗余，因为切流前后一直使用同一个 videoQueue_ 和 frameQueue_
+        videoDecoder_.decoder_rebind_queue(&videoQueue_, &frameQueue_);
+        LOGW_PLAYER(playerId_, "reuse decoder successfully");
+        return 0;
+    }
+
+    //有旧 avctx，但参数不兼容，且线程还在跑 -> 不允许重建，返回 EAGAIN
+    if (videoDecoder_.avctx_ &&
+        (videoDecoder_.decoder_thread_running() || videoDecoder_.refresh_thread_running())) {
+        LOGW_PLAYER(playerId_, "ensure_decoder cannot rebuild while decoder threads are running");
+        return AVERROR(EAGAIN);
+    }
+
+    // 没有 avctx，或旧 avctx 已经不在被线程使用 -> 释放旧 avctx，重建新的
+    LOGD_PLAYER(playerId_, "ensure_decoder rebuild decoder");
+    if (videoDecoder_.avctx_) {
+        LOGD_PLAYER(playerId_, "ensure_decoder free old avctx=%p", videoDecoder_.avctx_);
+        avcodec_free_context(&videoDecoder_.avctx_);
+    }
+
+    AVCodecContext* avctx = nullptr;
+    int useHw = 0;
+    const int ret = initDecoderWithFallback(fmtCtx, streamIndex, &avctx, &useHw);
+    if (ret < 0) {
+        LOGD_PLAYER(playerId_, "ensure_decoder rebuild failed ret=%d", ret);
+        return ret;
+    }
+
+    LOGD_PLAYER(playerId_, "ensure_decoder rebuild success useHw=%d avctx=%p", useHw, avctx);
+    videoDecoder_.decoder_init(avctx, &videoQueue_, &frameQueue_);
+    videoDecoder_.time_base = stream->time_base;
+    useHw_ = useHw;
+    return 0;
+}
+
+//initDecoderWithFallback() 负责创建 FFmpeg 的 AVCodecContext
 int RtspPlayer::initDecoderWithFallback(AVFormatContext* fmtCtx, int streamIndex, AVCodecContext** avctx, int* useHw) {
     const AVCodec* codec = avcodec_find_decoder_by_name("hevc_mediacodec");
     int ret = 0;
@@ -899,15 +1029,15 @@ int RtspPlayer::streamComponentOpen(int streamIndex, AVFormatContext* fmtCtx) {
         return AVERROR(EINVAL);
     }
 
-    AVCodecContext* avctx = nullptr;
-    const int ret = initDecoderWithFallback(fmtCtx, streamIndex, &avctx, &useHw_);
+    const int ret = ensureDecoderForStream(fmtCtx, streamIndex);
     if (ret < 0) {
         return ret;
     }
 
-    if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
-        videoDecoder_.decoder_init(avctx, &videoQueue_, &frameQueue_);
+    if (!videoDecoder_.decoder_thread_running()) {
         videoDecoder_.decoder_start("video_thread");
+    }
+    if (!videoDecoder_.refresh_thread_running()) {
         videoDecoder_.refresh_start("refresh_thread", &frameQueue_);
         if (switchTraceActive_.load()) {
             const int64_t refreshThreadUs = nowMonotonicUs();
@@ -1110,10 +1240,12 @@ void RtspPlayer::cleanupPlaybackState(AVFormatContext** fmtCtx) {
         clearInterruptTimeout();
     }
 
-    videoDecoder_.decoder_abort();
-    videoDecoder_.decoder_destroy();
-    packet_queue_destroy(&videoQueue_);
-    frame_queue_destroy(&frameQueue_);
+    if (!abortRequested_.load()) {
+        videoDecoder_.decoder_flush_for_switch();
+    } else {
+        packet_queue_flush(&videoQueue_);
+        frame_queue_flush(&frameQueue_);
+    }
     LOGD_PLAYER(playerId_, "cleanupPlaybackState");
 }
 

@@ -28,7 +28,7 @@ typedef struct PacketQueue {
     int		nb_packets;   // 包数量，也就是队列元素数量
     int		size;         // 队列所有元素的数据大小总和
     int64_t		duration; // 队列所有元素的数据播放持续时间
-    int		abort_request; // 用户退出请求标志
+    std::atomic<int> abort_request{0}; // 用户退出请求标志
     std::mutex	mutex;     // 用于维持PacketQueue的多线程安全
     std::condition_variable	cond;      // 用于读、写线程相互通知
 
@@ -45,7 +45,7 @@ typedef struct FramePool {
     std::vector<AVFrame*> free_frames;
     std::mutex mutex;
     std::condition_variable cond;
-    int abort_request = 0;
+    std::atomic<int> abort_request{0};
     int owner_player_id = -1;
 } FramePool;
 
@@ -57,7 +57,7 @@ typedef struct FrameQueue {
     int max_size;
     std::mutex frameMutex;
     std::condition_variable	frameCond;
-    int abort_request = 0;
+    std::atomic<int> abort_request{0};
     std::atomic<int> drop{0}; // 队列满时丢帧
     std::atomic<int> late_drop{0}; // 渲染阶段晚到丢帧
     std::atomic<int> rendered{0}; // 实际渲染成功的帧数
@@ -72,6 +72,8 @@ typedef struct FrameQueue {
     // 当前是否进入“高帧率模式”。
     // 高帧率流更容易快速积压，所以水位线会再提前一帧触发。
     std::atomic<int> adaptive_high_fps{0};
+    // 每次切流清空队列后递增，刷新线程据此重置时间基准。
+    std::atomic<int> generation{0};
     int owner_player_id = -1;
 
 } FrameQueue;
@@ -104,6 +106,8 @@ void frame_queue_push(FrameQueue *fq,AVFrame* frame);
 // 弹出 frame，队列为空则阻塞
 AVFrame* frame_queue_pop(FrameQueue* fq);
 void frame_queue_destroy(FrameQueue* fq);
+void frame_queue_start(FrameQueue* fq);
+void frame_queue_flush(FrameQueue* fq);
 
 // 非阻塞获取当前队列大小
 int frame_queue_size(FrameQueue* fq);

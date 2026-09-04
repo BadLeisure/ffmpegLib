@@ -358,7 +358,7 @@ int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block)
     return ret;
 }
 
-
+//首次初始化队列结构
 int frame_queue_init(FrameQueue* fq, int max_size) {
     if (!fq) {
         return -1;
@@ -379,6 +379,7 @@ int frame_queue_init(FrameQueue* fq, int max_size) {
     fq->adaptive_mid_congestion.store(0, kQueueStateOrder);
     fq->adaptive_high_congestion.store(0, kQueueStateOrder);
     fq->adaptive_high_fps.store(0, kQueueStateOrder);
+    fq->generation.store(0, kQueueStateOrder);
 
     return 0;
 }
@@ -405,6 +406,54 @@ void frame_queue_destroy(FrameQueue* fq) {
     fq->adaptive_mid_congestion.store(0, kQueueStateOrder);
     fq->adaptive_high_congestion.store(0, kQueueStateOrder);
     fq->adaptive_high_fps.store(0, kQueueStateOrder);
+    fq->generation.fetch_add(1, kQueueStateOrder);
+}
+
+//让已经存在的队列重新进入工作状态
+void frame_queue_start(FrameQueue* fq) {
+    if (!fq) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(fq->frameMutex);
+        fq->abort_request = 0;
+    }
+    if (fq->frame_pool) {
+        {
+            std::lock_guard<std::mutex> lock(fq->frame_pool->mutex);
+            fq->frame_pool->abort_request = 0;
+        }
+        fq->frame_pool->cond.notify_all();
+    }
+    fq->frameCond.notify_all();
+}
+
+//frame_queue_flush() 用来清空 FrameQueue 中还没显示的所有视频帧，但保留队列和线程继续使用
+void frame_queue_flush(FrameQueue* fq) {
+    if (!fq) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(fq->frameMutex);
+    for (int i = 0; i < fq->max_size; ++i) {
+        if (fq->queue[i]) {
+            release_frame_to_pool(fq, fq->queue[i]);
+            fq->queue[i] = nullptr;
+        }
+    }
+    fq->size.store(0, kQueueStateOrder);
+    fq->rindex = 0;
+    fq->windex = 0;
+    fq->drop.store(0, kQueueStateOrder);
+    fq->late_drop.store(0, kQueueStateOrder);
+    fq->rendered.store(0, kQueueStateOrder);
+    fq->total.store(0, kQueueStateOrder);
+    fq->adaptive_mid_congestion.store(0, kQueueStateOrder);
+    fq->adaptive_high_congestion.store(0, kQueueStateOrder);
+    fq->adaptive_high_fps.store(0, kQueueStateOrder);
+    fq->generation.fetch_add(1, kQueueStateOrder);
+    fq->frameCond.notify_all();
 }
 
 

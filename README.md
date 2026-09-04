@@ -106,3 +106,34 @@ app/src/main/cpp/
 应用层使用openGL做渲染，以及使用RtspPlayerClient做为客户端与native的实例对应。
 未来可能兼容：单实例多路
 单实例多路：一个 RtspPlayer 里面放多个 session，每个 session 才有自己的 readThread + PacketQueue + Decoder + FrameQueue + VideoFrameBuffer + callback，其实就是把实例从外面提到了里面，只不过需要多包一层管理器
+
+## 0902 流程调整总结
+
+### 当前流程
+
+当前切流流程调整为“线程常驻 + 相同参数复用 decoder”的模式：
+
+- `PacketQueue` 和 `FrameQueue` 在 `RtspPlayer` 创建时初始化一次，在析构时统一销毁；切流过程中不再重复 `init/destroy`
+- `streamComponentOpen()` 当前的职责变成：
+  - 先调用 `ensureDecoderForStream()` 判断当前 `AVCodecContext` 是否可复用
+  - 如果当前还没有 `AVCodecContext`，则首次创建并绑定到 `Decoder`
+  - 如果已有 `AVCodecContext` 且新流参数一致，则直接复用已有 `AVCodecContext`
+  - `decoder_thread` 和 `refresh_thread` 只在首次需要时启动，后续切流不再重复创建线程
+- 切流时如果存在 `pendingUrl`，不再调用 `decoder_abort` 销毁线程，而是调用 `decoder_flush_for_switch()`：
+  - 清空 `packet_queue` 和 `frame_queue` 中残留的旧流数据
+  - flush 当前 `AVCodecContext`
+  - 重置 `renderKeyFrameReady`、`packet_pending` 等解码状态
+  - 重新启动队列的工作状态，让常驻线程继续消费新流数据
+- `refresh` 线程增加 `generation` 机制：每次 `frame_queue_flush()` 后递增 `generation`，`refresh` 线程检测到 `generation` 变化后会重置 `frame_timer`、`last_frame_pts`、`session_base_pts`、`avgFrameIntervalSec` 等时间状态，避免新旧流 `PTS` 不连续导致首帧误判、丢帧或节奏异常
+
+### 和之前的区别
+
+- 之前每次切流都会走 `decoder_init + decoder_start + refresh_start`，并在 `cleanupPlaybackState` 中执行 `decoder_abort + decoder_destroy`
+- 现在切流只关闭旧的 `AVFormatContext`，保留 `Decoder`、`video_thread`、`video_refresh_thread` 和队列对象本身
+- 之前切流的主要耗时点之一是反复初始化解码器和线程；现在同参数切流会直接复用 `AVCodecContext`，只做 flush 和状态重置
+- `stop/destroy` 仍然会真正调用 `decoder_abort` 退出线程；切流场景下则尽量保留常驻线程
+
+### 当前限制
+
+- 只有在新旧流 `codec_id`、`codec_type`、分辨率、像素格式、`extradata` 等参数一致时才复用 `AVCodecContext`
+- 如果线程仍在运行且参数不一致，目前不会在线重建 `AVCodecContext`，而是返回 `EAGAIN`，避免后台线程访问已释放的解码器上下文

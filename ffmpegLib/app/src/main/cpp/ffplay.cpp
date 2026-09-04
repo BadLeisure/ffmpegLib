@@ -31,6 +31,7 @@ int Decoder::refresh_start(const char *thread_name,FrameQueue *fq){
         return -1;
     }
 
+    frame_queue_start(fq);
     video_refresh_thread_ = new std::thread(&Decoder::video_refresh_thread,this,fq);
     return 0;
 }
@@ -60,15 +61,18 @@ int Decoder::video_thread()
             continue;
         }
 
-        // 包级 key frame gate 之外，再保留一层渲染侧兜底开闸。
-        if (!renderKeyFrameReady_) {
-            if (frame->key_frame != 1) {
-                LOG_QUEUE_PLAYER(owner_player_id_, "drop decoded non-I frame before render gate opens");
-                av_frame_unref(frame);
-                continue;
+        // 包级 key frame gate 之外，再保留一层渲染侧兜底?
+        {
+            std::lock_guard<std::mutex> gate_lock(output_mutex_);
+            if (!renderKeyFrameReady_) {
+                if (frame->key_frame != 1) {
+                    LOG_QUEUE_PLAYER(owner_player_id_, "drop decoded non-I frame before render gate opens");
+                    av_frame_unref(frame);
+                    continue;
+                }
+                renderKeyFrameReady_ = 1;
+                LOGD_PLAYER(owner_player_id_, "render gate opened by first decoded I frame");
             }
-            renderKeyFrameReady_ = 1;
-            LOGD_PLAYER(owner_player_id_, "render gate opened by first decoded I frame");
         }
 
         // 这里不再创建中间 I420 AVFrame，直接把解码原始帧入队。
@@ -86,7 +90,15 @@ int Decoder::video_thread()
             continue;
         }
 
-        frame_queue_push(framequeue, queued_frame);
+        {
+            std::lock_guard<std::mutex> output_lock(output_mutex_);
+            if (switching_.load()) {
+                frame_pool_release(&framePool_, queued_frame);
+                av_frame_unref(frame);
+                continue;
+            }
+            frame_queue_push(framequeue, queued_frame);
+        }
         av_frame_unref(frame);
     }
 
@@ -151,6 +163,18 @@ int Decoder::video_refresh_thread(FrameQueue *fq)
     while (!fq->abort_request) {
         AVFrame *frame = frame_queue_pop(fq);
         if (!frame) continue;
+        const int current_generation = fq->generation.load();
+        //当两者不一样的时候，说明已经切到了新流，重置状态，防止新旧流PTS 不连续造成播放卡顿
+        if (current_generation != session_generation) {
+            frame_timer = 0.0;
+            last_frame_pts = NAN;
+            last_frame_duration = kDefaultFrameIntervalSec;
+            session_base_pts = AV_NOPTS_VALUE;
+            avgFrameIntervalSec = kDefaultFrameIntervalSec;
+            avgBacklog = 0.0;
+            session_generation = current_generation;
+            LOGD_PLAYER(owner_player_id_, "video_refresh_thread reset timing state for new stream");
+        }
         LOG_FRAME_PLAYER(owner_player_id_, "frame_queue_pop,frame->pts = %ld", frame->pts);
 
         // 按队列积压动态调节渲染策略：积压越高，越偏向追实时。
@@ -186,7 +210,13 @@ int Decoder::video_refresh_thread(FrameQueue *fq)
             frame_timer = now;
             last_frame_pts = pts_s;
 
+            const double callback_start = now_seconds();
             mVideoCallback(frame, pts_s);
+            const double callback_end = now_seconds();
+            LOGD_PLAYER(owner_player_id_,
+                        "mVideoCallback first frame: pts_s=%f, start=%f, end=%f, cost_ms=%.3f",
+                        pts_s, callback_start, callback_end,
+                        (callback_end - callback_start) * 1000.0);
             frame_pool_release(&framePool_, frame);
             continue;
         }
@@ -217,24 +247,33 @@ int Decoder::video_refresh_thread(FrameQueue *fq)
             continue;
         }
 
+        const double high_backlog_sleep_cap = 0.003; // or 0.004
         if (now < target_time) {
-            // 积压高时不休眠直接追帧；中水位时只短休眠，减少排队延迟。
-            if (!high_backlog) {
-                const double sleep_cap = mid_backlog ? backlog_sleep_cap : normal_sleep_cap;
-                const double sleep_time = FFMIN(target_time - now, sleep_cap);
-                LOG_FRAME_PLAYER(owner_player_id_, "sleep %f seconds to refresh", sleep_time);
-                if (sleep_time > 0.0) {
-                    av_usleep((int64_t)(sleep_time * 1000000));
-                }
+            double sleep_cap = normal_sleep_cap;
+            if (high_backlog) {
+                sleep_cap = high_backlog_sleep_cap;
+            } else if (mid_backlog) {
+                sleep_cap = backlog_sleep_cap;
+            }
+
+            const double sleep_time = FFMIN(target_time - now, sleep_cap);
+            if (sleep_time > 0.0) {
+                av_usleep((int64_t)(sleep_time * 1000000));
             }
             now = now_seconds();
         }
 
         //先渲染
+        const double callback_start = now_seconds();
         mVideoCallback(frame,pts_s);
+        const double callback_end = now_seconds();
+        LOGD_PLAYER(owner_player_id_,
+                    "mVideoCallback: pts_s=%f, backlog=%d, target_time=%f, start=%f, end=%f, cost_ms=%.3f",
+                    pts_s, queue_backlog, target_time, callback_start, callback_end,
+                    (callback_end - callback_start) * 1000.0);
         frame_queue_record_render(fq);
         // 到时间了 → 更新 frame_timer
-        frame_timer = now;
+        frame_timer = callback_end;
         last_frame_pts = pts_s;
         frame_pool_release(&framePool_, frame);
     }
@@ -253,11 +292,12 @@ int Decoder::decoder_decode_frame(AVFrame * frame)
     int ret = AVERROR(EAGAIN);
     for (;;) {
         AVPacket pkt;
-        // 1. 流连续情况下获取解码后的帧
-            do {
+        bool has_pending_packet = false;
 
-                // 1.2. 获取解码帧
-                if(avctx_->codec_type == AVMEDIA_TYPE_VIDEO){
+        {
+            std::lock_guard<std::mutex> lock(decoder_mutex_);
+            do {
+                if (avctx_->codec_type == AVMEDIA_TYPE_VIDEO) {
                     ret = avcodec_receive_frame(avctx_, frame);
                     if (ret >= 0) {
                         frame->pts = frame->best_effort_timestamp;
@@ -274,46 +314,38 @@ int Decoder::decoder_decode_frame(AVFrame * frame)
                 if (ret >= 0) {
                     return 1;
                 }
-            } while (ret != AVERROR(EAGAIN));   // 1.5 没帧可读时ret返回EAGIN，需要继续送packet
-
-
-            // 2.1 如果没有数据可读则唤醒read_thread, 实际是continue_read_thread SDL_cond
-            //            if (queue_->nb_packets == 0)  // 没有数据可读
-            //                SDL_CondSignal(empty_queue_cond);// 通知read_thread放入packet
-            // 2.2 如果还有pending的packet则使用它
-
+            } while (ret != AVERROR(EAGAIN));
 
             if (packet_pending_) {
                 av_packet_move_ref(&pkt, &pkt_);
                 packet_pending_ = 0;
-            } else {
-                // 2.3 阻塞式读取packet
-                if (packet_queue_get(queue_, &pkt, 1) < 0) {
-                    return -1;
-                }
+                has_pending_packet = true;
             }
-
-        // 3 将packet送入解码器
-        if (packet_queue_is_flush_packet(queue_, &pkt)) {
-            // when seeking or when switching to a different stream
-            avcodec_flush_buffers(avctx_); //清空里面的缓存帧
-
-        } else {
-            //用于标记 “上次发送数据包时因解码器忙碌而暂存的包”（如 avcodec_send_packet 返回 AVERROR(EAGAIN) 时，会将包暂存为 pkt_）
-
-            int result = avcodec_send_packet(avctx_,&pkt);
-
-                if (result == AVERROR(EAGAIN)) {
-                    //                    av_log(avctx, AV_LOG_ERROR, "Receive_frame and send_packet both returned EAGAIN, which is an API violation.\n");
-
-                    packet_pending_ = 1;
-                    av_packet_move_ref(&pkt_, &pkt);
-                }
-            }
-
-            av_packet_unref(&pkt);	// 一定要自己去释放音视频数据
         }
 
+        if (!has_pending_packet) {
+            if (packet_queue_get(queue_, &pkt, 1) < 0) {
+                return -1;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(decoder_mutex_);
+            if (packet_queue_is_flush_packet(queue_, &pkt)) {
+                avcodec_flush_buffers(avctx_);
+                av_packet_unref(&pkt);
+                return 0;
+            }
+
+            int result = avcodec_send_packet(avctx_, &pkt);
+            if (result == AVERROR(EAGAIN)) {
+                packet_pending_ = 1;
+                av_packet_move_ref(&pkt_, &pkt);
+            }
+        }
+
+        av_packet_unref(&pkt);
+    }
 }
 
 int Decoder::get_video_frame(AVFrame * frame)
@@ -362,6 +394,7 @@ void Decoder::decoder_abort()
         FrameQueueStats stats = frame_queue_get_stats(fq);
         LOGD_PLAYER(owner_player_id_, "decoder summary, total=%d, queue_drop=%d, late_drop=%d, rendered=%d, total_drop=%d",
              stats.total, stats.drop, stats.late_drop, stats.rendered, stats.drop + stats.late_drop);
+        frame_queue_flush(fq);
     }
     LOGD_PLAYER(owner_player_id_, "thread join over");
     queue_ = nullptr;
@@ -369,6 +402,63 @@ void Decoder::decoder_abort()
     packet_pending_ = 0;
     LOGD_PLAYER(owner_player_id_, "decoder_abort_over");
 }
+
+void Decoder::decoder_flush_for_switch()
+{
+    LOGD_PLAYER(owner_player_id_, "decoder_flush_for_switch start");
+    switching_.store(true);
+
+    if (queue_) {
+        packet_queue_flush(queue_);
+        packet_queue_start(queue_);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(decoder_mutex_);
+        packet_pending_ = 0;
+        if (pkt_.data) {
+            av_packet_unref(&pkt_);
+        }
+        if (avctx_) {
+            avcodec_flush_buffers(avctx_);
+        }
+    }
+
+    if (framequeue) {
+        std::lock_guard<std::mutex> output_lock(output_mutex_);
+        frame_queue_flush(framequeue);
+        frame_queue_start(framequeue);
+    }
+
+    {
+        std::lock_guard<std::mutex> gate_lock(output_mutex_);
+        renderKeyFrameReady_ = 0;
+    }
+    switching_.store(false);
+    LOGD_PLAYER(owner_player_id_, "decoder_flush_for_switch over");
+}
+
+void Decoder::decoder_rebind_queue(PacketQueue* queue, FrameQueue* frameQueue)
+{
+    queue_ = queue;
+    framequeue = frameQueue;
+    if (framequeue) {
+        framequeue->frame_pool = &framePool_;
+    }
+    LOGD_PLAYER(owner_player_id_, "decoder_rebind_queue queue=%p frameQueue=%p",
+         queue_, framequeue);
+}
+
+bool Decoder::decoder_thread_running() const
+{
+    return decoder_thread_ && decoder_thread_->joinable();
+}
+
+bool Decoder::refresh_thread_running() const
+{
+    return video_refresh_thread_ && video_refresh_thread_->joinable();
+}
+
 void Decoder::decoder_destroy()
 {
     if (pkt_.data) {
