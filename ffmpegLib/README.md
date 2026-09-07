@@ -11,3 +11,35 @@
 1、添加ffmpeg硬解码以及实现硬解码失败自动退回软解码
 2、添加启动mediacodec硬解码的编译脚本
 3、添加libyuv库，实现NV12到I420的转换
+
+0902:
+1、当前切流流程调整为“线程常驻 + 相同参数复用decoder”的模式
+2、PacketQueue 和 FrameQueue 改为在 RtspPlayer 创建时初始化一次，在析构时统一销毁；切流过程中不再重复 init/destroy
+3、streamComponentOpen 当前的职责变成：
+   1) 先调用 ensureDecoderForStream 判断当前 AVCodecContext 是否可复用
+   2) 如果还没有 AVCodecContext，则首次创建并绑定到 Decoder
+   3) 如果已有 AVCodecContext 且新流参数一致，则直接复用已有 AVCodecContext
+   4) decoder_thread 和 refresh_thread 只在首次需要时启动，后续切流不再重复创建线程
+4、切流时如果存在 pendingUrl，不再调用 decoder_abort 销毁线程，而是调用 decoder_flush_for_switch：
+   1) 清空 packet_queue 和 frame_queue 中残留的旧流数据
+   2) flush 当前 AVCodecContext
+   3) 重置 renderKeyFrameReady、packet_pending 等解码状态
+   4) 重新启动队列的工作状态，让常驻线程继续消费新流数据
+5、refresh 线程增加 generation 机制：每次 frame_queue_flush 后递增 generation，refresh 线程检测到 generation 变化后重置 frame_timer、last_frame_pts、session_base_pts、avgFrameIntervalSec 等时间状态，避免新旧流 PTS 不连续导致首帧误判、丢帧或节奏异常
+6、与之前流程的主要区别：
+   1) 之前每次切流都会走 decoder_init + decoder_start + refresh_start，并在 cleanupPlaybackState 中 decoder_abort + decoder_destroy
+   2) 现在切流只关闭旧的 AVFormatContext，保留 Decoder、video_thread、video_refresh_thread 和队列对象本身
+   3) 之前切流的主要耗时点之一是反复初始化解码器和线程；现在同参数切流会直接复用 AVCodecContext，只做 flush 和状态重置
+   4) stop/destroy 仍然会真正调用 decoder_abort 退出线程；切流场景下则尽量保留常驻线程
+7、当前限制：
+   1) 只有在新旧流 codec_id、codec_type、分辨率、像素格式、extradata 等参数一致时才复用 AVCodecContext
+   2) 如果线程仍在运行且参数不一致，目前不会在线重建 AVCodecContext，而是返回 EAGAIN，避免后台线程访问已释放的解码器上下文
+0904:
+1、补充“同参数复用 + 不兼容参数重建”的双路径切流策略：
+   1) `ensureDecoderForStream()` 先判断当前 `AVCodecContext` 是否可复用；
+   2) 新旧流 `codec_id`、`codec_type`、分辨率、`extradata` 等关键参数一致时，直接复用已有 `AVCodecContext`；
+   3) 参数不一致时，不再返回 `EAGAIN`，而是调用 `rebuildDecoderForStream()` 执行“停止旧 decoder/refresh 线程 -> 释放旧 `AVCodecContext` -> 重新创建并初始化 decoder”的重建流程；
+   4) `streamComponentOpen()` 保持“确保 decoder 就绪后再按需启动线程”的职责，保证异构流切换后仍能继续正常解码和播放。
+2、恢复硬解起播门控逻辑：
+   1) 当启用 `hevc_mediacodec` 硬解时，送解码前会检测包内 `VPS/SPS/PPS` 与 `IRAP`；
+   2) 只有参数集就绪且收到 `IRAP` 后才正式喂给硬解码器，避免切流或重连后硬解直接吃到无效起始包。

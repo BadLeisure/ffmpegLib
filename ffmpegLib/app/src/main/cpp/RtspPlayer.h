@@ -22,9 +22,9 @@ extern "C" {
 class RtspPlayer {
 public:
     enum class PlayerState {
-        Idle,
-        Running,
-        Stopping,
+        Idle, //空闲，没在播
+        Running, //正在播
+        Stopping, //正在停，后台线程还在收尾
     };
 
     explicit RtspPlayer(JavaVM* jvm);
@@ -50,6 +50,7 @@ private:
     int ensureDecoderForStream(AVFormatContext* fmtCtx, int streamIndex);
     // 判断当前解码器是否还能复用到新流。
     bool canReuseDecoderForStream(AVFormatContext* fmtCtx, int streamIndex) const;
+    int rebuildDecoderForStream(AVFormatContext* fmtCtx, int streamIndex, AVStream* stream);
 
     bool waitRetryInterruptible(std::chrono::milliseconds delay);
     std::chrono::milliseconds nextRetryDelay(RetryReason reason);

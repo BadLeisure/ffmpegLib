@@ -936,19 +936,17 @@ int RtspPlayer::ensureDecoderForStream(AVFormatContext* fmtCtx, int streamIndex)
         return 0;
     }
 
-    //有旧 avctx，但参数不兼容，且线程还在跑 -> 不允许重建，返回 EAGAIN
-    if (videoDecoder_.avctx_ &&
-        (videoDecoder_.decoder_thread_running() || videoDecoder_.refresh_thread_running())) {
-        LOGW_PLAYER(playerId_, "ensure_decoder cannot rebuild while decoder threads are running");
-        return AVERROR(EAGAIN);
-    }
+    return rebuildDecoderForStream(fmtCtx, streamIndex, stream);
+}
 
-    // 没有 avctx，或旧 avctx 已经不在被线程使用 -> 释放旧 avctx，重建新的
-    LOGD_PLAYER(playerId_, "ensure_decoder rebuild decoder");
+int RtspPlayer::rebuildDecoderForStream(AVFormatContext* fmtCtx, int streamIndex, AVStream* stream) {
     if (videoDecoder_.avctx_) {
+        LOGW_PLAYER(playerId_, "ensure_decoder rebuild after teardown");
+        videoDecoder_.decoder_abort();
         LOGD_PLAYER(playerId_, "ensure_decoder free old avctx=%p", videoDecoder_.avctx_);
         avcodec_free_context(&videoDecoder_.avctx_);
     }
+    LOGD_PLAYER(playerId_, "ensure_decoder rebuild decoder");
 
     AVCodecContext* avctx = nullptr;
     int useHw = 0;
@@ -965,7 +963,8 @@ int RtspPlayer::ensureDecoderForStream(AVFormatContext* fmtCtx, int streamIndex)
     return 0;
 }
 
-//initDecoderWithFallback() 负责创建 FFmpeg 的 AVCodecContext
+
+//initDecoderWithFallback() 负责创建 FFmpeg 的AVCodecContext
 int RtspPlayer::initDecoderWithFallback(AVFormatContext* fmtCtx, int streamIndex, AVCodecContext** avctx, int* useHw) {
     const AVCodec* codec = avcodec_find_decoder_by_name("hevc_mediacodec");
     int ret = 0;
@@ -1104,9 +1103,9 @@ void RtspPlayer::reportFfmpegError(int ffErr) {
 }
 
 
-// 先把码流里为了防止误识别 start code 而插入的 0x03 去掉，再按真实 SEI 数据格式解析。
-// 只有 payloadType=5(user_data_unregistered) 时，才打印业务日志并回调 Java。
-//一个pkt里面可能有很多NALU，每个NALU里又可能有多个payload，所以要循环解析。
+// 先把码流里为了防止误识别 start code 而插入的 0x03 去掉，再按真SEI 数据格式解析
+// 只有 payloadType=5(user_data_unregistered) 时，才打印业务日志并回调 Java
+//一个pkt里面可能有很多NALU，每个NALU里又可能有多个payload，所以要循环解析
 bool RtspPlayer::extractHevcSeiAndCallback(const uint8_t* data, int size) {
     if (!data || size <= 0) {
         return false;
@@ -1181,7 +1180,7 @@ bool RtspPlayer::extractHevcSeiAndCallback(const uint8_t* data, int size) {
 
                         // 越界保护
                         if (offset + payloadSize > sei_size) {
-        LOGW_PLAYER(playerId_, "SEI parse out of bounds, stop parsing");
+                        LOGW_PLAYER(playerId_, "SEI parse out of bounds, stop parsing");
                             break;
                         }
 

@@ -27,9 +27,9 @@ public:
 
 
     //解码线程
-    std::thread *decoder_thread_ = NULL;
+    std::thread decoder_thread_;
 
-    std::thread *video_refresh_thread_ = NULL;
+    std::thread video_refresh_thread_;
 
     std::function<int(const AVFrame*,double)> mVideoCallback;
     std::mutex decoder_mutex_;

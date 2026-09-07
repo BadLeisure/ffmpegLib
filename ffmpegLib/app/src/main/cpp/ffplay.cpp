@@ -21,7 +21,7 @@ int Decoder::decoder_start( const char *thread_name)
     // 启用包队列
     packet_queue_start(queue_);
     //创建一个新线程，让这个线程去执行 Decoder 对象的 video_thread 成员函数
-    decoder_thread_ = new std::thread(&Decoder::video_thread, this);
+    decoder_thread_ = std::thread(&Decoder::video_thread, this);
     return 0;
 }
 
@@ -32,7 +32,7 @@ int Decoder::refresh_start(const char *thread_name,FrameQueue *fq){
     }
 
     frame_queue_start(fq);
-    video_refresh_thread_ = new std::thread(&Decoder::video_refresh_thread,this,fq);
+    video_refresh_thread_ = std::thread(&Decoder::video_refresh_thread,this,fq);
     return 0;
 }
 
@@ -374,17 +374,13 @@ void Decoder::decoder_abort()
     }
     frame_pool_abort(&framePool_);
     LOGD_PLAYER(owner_player_id_, "before decoder_thread join");
-    if(decoder_thread_ && decoder_thread_->joinable()) {
-        decoder_thread_->join(); // 等待解码线程退出
-        delete decoder_thread_;
-        decoder_thread_ = NULL;
+    if (decoder_thread_.joinable()) {
+        decoder_thread_.join(); // 等待解码线程退出
     }
     LOGD_PLAYER(owner_player_id_, "after decoder_thread join");
 
-    if(video_refresh_thread_ && video_refresh_thread_->joinable()){
-        video_refresh_thread_->join(); // 等待解码线程退出
-        delete video_refresh_thread_;
-        video_refresh_thread_ = NULL;
+    if (video_refresh_thread_.joinable()) {
+        video_refresh_thread_.join(); // 等待渲染线程退出
     }
     LOGD_PLAYER(owner_player_id_, "after video_refresh_thread join");
     if (queue != nullptr) {
@@ -451,12 +447,12 @@ void Decoder::decoder_rebind_queue(PacketQueue* queue, FrameQueue* frameQueue)
 
 bool Decoder::decoder_thread_running() const
 {
-    return decoder_thread_ && decoder_thread_->joinable();
+    return decoder_thread_.joinable();
 }
 
 bool Decoder::refresh_thread_running() const
 {
-    return video_refresh_thread_ && video_refresh_thread_->joinable();
+    return video_refresh_thread_.joinable();
 }
 
 void Decoder::decoder_destroy()
@@ -492,6 +488,7 @@ void Decoder::decoder_init(AVCodecContext * avctx, PacketQueue * queue, FrameQue
     }
     packet_pending_ = 0;
     renderKeyFrameReady_ = 0;
+    session_generation = -1;
     av_init_packet(&pkt_);
     pkt_.data = nullptr;
     pkt_.size = 0;
@@ -499,5 +496,8 @@ void Decoder::decoder_init(AVCodecContext * avctx, PacketQueue * queue, FrameQue
 
 Decoder::~Decoder()
 {
-
+    decoder_abort();
+    decoder_destroy();
 }
+
+

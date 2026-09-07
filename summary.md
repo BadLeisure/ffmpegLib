@@ -39,3 +39,5 @@
 - 负责基于 `Android NDK + FFmpeg + JNI` 的 RTSP 实时播放器研发，搭建拉流、解复用、软硬解码、帧队列调度、I420 输出与 Java/OpenGL 渲染对接的完整 native 播放链路，支持 HEVC SEI 解析与 `DirectByteBuffer` 低拷贝传输。
 - 主导播放器多线程架构与低延迟优化，设计 `PacketQueue + FrameQueue + 解码/刷新线程` 解耦模型，并将切流流程优化为“线程常驻 + 同参数复用 decoder”，减少重复初始化开销，提升实时播放稳定性和切流响应速度。
 - 完善播放器鲁棒性与可观测性，支持连接/读包超时中断、自动重连、关键帧门控、硬解优先软解回退及切流耗时链路日志，提升异常流场景下的可恢复性和问题定位效率。
+### 2026-09-04 补充亮点
+- 在“线程常驻 + 同参数复用 decoder”快路径之外，进一步补齐“参数不兼容时 teardown + rebuild decoder”的慢路径：`ensureDecoderForStream()` 可在异构流切换时安全停掉旧 decoder/refresh 线程、释放旧 `AVCodecContext` 并重建解码器，避免此前返回 `EAGAIN` 导致切流失败，提升复杂流场景下的可恢复性与可用性。
