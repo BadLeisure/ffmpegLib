@@ -34,6 +34,12 @@ public:
     void start(const std::string& url);
     void stop();
     void requestStop();
+    // 临时暂停网络拉流，保留播放器对象和恢复所需的 URL。
+    void pauseForBandwidth();
+    // 恢复暂停前的网络拉流。
+    void resumeAfterBandwidth();
+    // 等待后台读包线程完成清理并回到 Idle。
+    bool waitUntilIdle(int timeoutMs);
 
 private:
     enum class RetryReason {
@@ -116,12 +122,16 @@ private:
     std::string rtspUrl_;
     std::string pendingRtspUrl_;
     bool hasPendingRtspUrl_ = false;
+    //播放器的“带宽暂停状态标记”，用于表示当前播放器是否处于临时暂停拉流状态
+    bool bandwidthPaused_ = false;
+    std::string bandwidthPausedUrl_;
     bool hevcParamsReady_ = false;
     bool hevcStartedOnIrap_ = false;
     bool hevcSeenVps_ = false;
     bool hevcSeenSps_ = false;
     bool hevcSeenPps_ = false;
     std::mutex stateMutex_;
+    std::condition_variable stateCond_;
     std::mutex retryMutex_;
     std::condition_variable retryCond_;
     int connectRetryCount_ = 0;

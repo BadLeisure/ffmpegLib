@@ -4,6 +4,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #include <android/log.h>
 
@@ -87,6 +88,56 @@ extern "C" JNIEXPORT void JNICALL nativeStopPlayer(JNIEnv* env, jobject thiz, jl
     player->stop();
 }
 
+extern "C" JNIEXPORT jboolean JNICALL nativePauseAllRtsp(JNIEnv* env, jobject thiz) {
+    (void)env;
+    (void)thiz;
+
+    //复制播放器列表，gPlayers是native 层维护的所有播放器
+    std::vector<std::shared_ptr<RtspPlayer>> players;
+    {
+        std::lock_guard<std::mutex> lock(gRegistryMutex);
+        players.reserve(gPlayers.size());
+        for (const auto& entry : gPlayers) {
+            players.push_back(entry.second);
+        }
+    }
+
+
+    for (const auto& player : players) {
+        //每个播放器都请求暂停，主要是“发出停止请求”，不一定已经完全停止
+        player->pauseForBandwidth();
+    }
+
+
+    bool allStopped = true;
+    for (const auto& player : players) {
+        if (!player->waitUntilIdle(5000)) {
+            allStopped = false;
+            LOGD("pauseAllRtsp timeout waiting for player to stop");
+        }
+    }
+    //所有播放器都停止成功 -> true
+    return allStopped ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL nativeResumeAllRtsp(JNIEnv* env, jobject thiz) {
+    (void)env;
+    (void)thiz;
+
+    std::vector<std::shared_ptr<RtspPlayer>> players;
+    {
+        std::lock_guard<std::mutex> lock(gRegistryMutex);
+        players.reserve(gPlayers.size());
+        for (const auto& entry : gPlayers) {
+            players.push_back(entry.second);
+        }
+    }
+
+    for (const auto& player : players) {
+        player->resumeAfterBandwidth();
+    }
+}
+
 extern "C" JNIEXPORT void JNICALL nativeDestroyPlayer(JNIEnv* env, jobject thiz, jlong handle) {
     (void)env;
     (void)thiz;
@@ -129,6 +180,8 @@ static JNINativeMethod kMethods[] = {
         {"createPlayer",  kCallbackSignature,               reinterpret_cast<void*>(nativeCreatePlayer)},
         {"startRtsp",     "(JLjava/lang/String;)V",         reinterpret_cast<void*>(nativeStartRtsp)},
         {"stopPlayer",    "(J)V",                           reinterpret_cast<void*>(nativeStopPlayer)},
+        {"pauseAllRtsp",  "()Z",                            reinterpret_cast<void*>(nativePauseAllRtsp)},
+        {"resumeAllRtsp", "()V",                            reinterpret_cast<void*>(nativeResumeAllRtsp)},
         {"destroyPlayer", "(J)V",                           reinterpret_cast<void*>(nativeDestroyPlayer)},};
 
 jint JNI_OnLoad(JavaVM* vm, void* reserved) {

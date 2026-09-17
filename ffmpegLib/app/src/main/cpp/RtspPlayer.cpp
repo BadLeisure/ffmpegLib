@@ -364,6 +364,11 @@ void RtspPlayer::start(const std::string& url) {
             return;
         }
 
+        if (bandwidthPaused_) {
+            LOGD_PLAYER(playerId_, "start ignored because player is paused for bandwidth");
+            return;
+        }
+
         const PlayerState currentState = state_.load();
         const std::string& currentOrPendingUrl = hasPendingRtspUrl_ ? pendingRtspUrl_ : rtspUrl_;
 
@@ -451,6 +456,64 @@ void RtspPlayer::ensureFrameBufferLocked() {
 
 void RtspPlayer::stop() {
     requestStop();
+}
+
+//保存当前 RTSP URL，设置暂停状态，请求读包线程退出，中断 av_read_frame()，关闭 RTSP 网络连接，清理播放队列
+void RtspPlayer::pauseForBandwidth() {
+    bool shouldRequestStop = false;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (bandwidthPaused_) {
+            return;
+        }
+
+        const PlayerState currentState = state_.load();
+        if (currentState == PlayerState::Running && !rtspUrl_.empty()) {
+            bandwidthPausedUrl_ = rtspUrl_;
+            bandwidthPaused_ = true;
+            shouldRequestStop = true;
+        } else if (currentState == PlayerState::Stopping) {
+            // 停止流程已经开始时仍标记为暂停，避免后续外部 start() 把流重新拉起。
+            bandwidthPaused_ = true;
+            shouldRequestStop = true;
+        } else {
+            bandwidthPaused_ = true;
+        }
+    }
+
+    if (shouldRequestStop) {
+        LOGD_PLAYER(playerId_, "pauseForBandwidth request stop");
+        requestStopInternal(true);
+    }
+}
+
+void RtspPlayer::resumeAfterBandwidth() {
+    std::string url;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        if (!bandwidthPaused_) {
+            return;
+        }
+        url = bandwidthPausedUrl_;
+        bandwidthPausedUrl_.clear();
+        bandwidthPaused_ = false;
+    }
+
+    if (!url.empty()) {
+        LOGD_PLAYER(playerId_, "resumeAfterBandwidth start url=%s", url.c_str());
+        start(url);
+    }
+}
+
+bool RtspPlayer::waitUntilIdle(int timeoutMs) {
+    std::unique_lock<std::mutex> lock(stateMutex_);
+    const auto isIdle = [this]() {
+        return state_.load() == PlayerState::Idle && !threadRunning_.load();
+    };
+    if (isIdle()) {
+        return true;
+    }
+    return stateCond_.wait_for(lock, std::chrono::milliseconds(timeoutMs), isIdle);
 }
 
 void RtspPlayer::requestStop() {
@@ -1262,6 +1325,7 @@ void RtspPlayer::releaseOwnedResources() {
     // 这样 stop 后再次 start 可以继续复用同一个输出缓冲对象；
     // 真正的 frameBuffer_ 释放放到 destroy/析构阶段统一处理。
     LOGD_PLAYER(playerId_, "releaseOwnedResources over, keep frameBuffer for restart");
+    stateCond_.notify_all();
 
 }
 
