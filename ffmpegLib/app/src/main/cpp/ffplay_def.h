@@ -4,8 +4,16 @@
 
 #ifndef FFMPEGNDK_FFPLAY_DEF_H
 #define FFMPEGNDK_FFPLAY_DEF_H
-#define VIDEO_PICTURE_QUEUE_SIZE 12
-#define VIDEO_FRAME_POOL_SIZE 14
+// 平滑优先档：稳态积压 2~4 帧（延迟预算 ~66ms），8 帧容量为 TCP 突发留吸收余量；
+// 池 = 队列容量 + 刷新线程持 1 + 解码线程持 1。
+#define VIDEO_PICTURE_QUEUE_SIZE 8
+#define VIDEO_FRAME_POOL_SIZE 10
+
+// PacketQueue 高水位默认值：内存防护用，正常播放时队列远小于该值。
+// size 达到 4MB 或包数达到 500 后，入队口进入受控丢包（非关键帧丢弃、关键帧清队重启），
+// 防止解码/渲染停滞时网络包无界堆积导致 OOM。
+#define PACKET_QUEUE_MAX_SIZE (4 * 1024 * 1024)
+#define PACKET_QUEUE_MAX_PACKETS 500
 
 
 extern  "C" {
@@ -38,6 +46,15 @@ typedef struct PacketQueue {
     AVPacket flush_pkt;
     int owner_player_id = -1;
 
+    // 受控丢包高水位：size 达到 max_size 或包数达到 max_packets 时触发（入队口检查）。
+    int64_t max_size = PACKET_QUEUE_MAX_SIZE;
+    int max_packets = PACKET_QUEUE_MAX_PACKETS;
+    // 溢出期间累计丢弃的包数（含关键帧清队），仅用于日志观测，flush 时清零。
+    int64_t overflow_drops = 0;
+    // 是否处于溢出 episode 中（用于限流日志与恢复判定）。
+    bool overflow_active = false;
+    int64_t last_overflow_log_us = 0;
+
 } PacketQueue;
 
 
@@ -51,6 +68,7 @@ typedef struct FramePool {
 
 typedef struct FrameQueue {
     AVFrame* queue[VIDEO_PICTURE_QUEUE_SIZE];
+    int64_t enqueue_us[VIDEO_PICTURE_QUEUE_SIZE]{};
     int rindex;
     int windex;
     std::atomic<int> size{0};
@@ -102,9 +120,9 @@ int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block);
 
 
 int frame_queue_init(FrameQueue* fq, int max_size);
-void frame_queue_push(FrameQueue *fq,AVFrame* frame);
+void frame_queue_push(FrameQueue *fq, AVFrame* frame, int64_t enqueue_us);
 // 弹出 frame，队列为空则阻塞
-AVFrame* frame_queue_pop(FrameQueue* fq);
+AVFrame* frame_queue_pop(FrameQueue* fq, int64_t* enqueue_us);
 void frame_queue_destroy(FrameQueue* fq);
 void frame_queue_start(FrameQueue* fq);
 void frame_queue_flush(FrameQueue* fq);

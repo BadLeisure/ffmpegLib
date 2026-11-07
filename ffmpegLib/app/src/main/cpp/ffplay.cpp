@@ -11,6 +11,174 @@ extern "C"{
 
 }
 
+namespace {
+constexpr int64_t kVideoDiagWindowUs = 1000000;
+constexpr double kLargePtsGapThresholdMs = 100.0;
+
+void maybe_flush_video_diag_locked(Decoder& decoder, int64_t now_us) {
+    if (decoder.video_diag_window_start_us_ == 0) {
+        decoder.video_diag_window_start_us_ = now_us;
+        return;
+    }
+    if (now_us - decoder.video_diag_window_start_us_ < kVideoDiagWindowUs) {
+        return;
+    }
+
+    LOGI_PLAYER(decoder.owner_player_id_,
+                "video_diag: 1s packets=%d, decoded=%d, rendered=%d, late_drop=%d, "
+                "decoded_pts_interval_ms[min/avg/max]=[%.1f/%.1f/%.1f] (count=%d), "
+                "pkt_recv_gap_max=%.1fms, "
+                "pkt_pts_gap_max=%.1fms (count=%d), pkt_wait_max=%.1fms, "
+                "decode_max=%.1fms, frame_wait_max=%.1fms, "
+                "frame_residence_max=%.1fms, schedule_late_max=%.1fms, "
+                "callback_max=%.1fms",
+                decoder.video_diag_packets_,
+                decoder.video_diag_decoded_frames_,
+                decoder.video_diag_rendered_frames_,
+                decoder.video_diag_late_drops_,
+                decoder.video_diag_decoded_pts_interval_count_ > 0
+                    ? decoder.video_diag_decoded_pts_interval_min_ms_ : 0.0,
+                decoder.video_diag_decoded_pts_interval_count_ > 0
+                    ? decoder.video_diag_decoded_pts_interval_sum_ms_ /
+                      decoder.video_diag_decoded_pts_interval_count_ : 0.0,
+                decoder.video_diag_decoded_pts_interval_count_ > 0
+                    ? decoder.video_diag_decoded_pts_interval_max_ms_ : 0.0,
+                decoder.video_diag_decoded_pts_interval_count_,
+                decoder.video_diag_packet_recv_gap_max_ms_,
+                decoder.video_diag_packet_pts_gap_max_ms_,
+                decoder.video_diag_large_pts_gap_count_,
+                decoder.video_diag_packet_queue_wait_max_ms_,
+                decoder.video_diag_decode_max_ms_,
+                decoder.video_diag_frame_wait_max_ms_,
+                decoder.video_diag_frame_residence_max_ms_,
+                decoder.video_diag_schedule_late_max_ms_,
+                decoder.video_diag_callback_max_ms_);
+
+    decoder.video_diag_window_start_us_ = now_us;
+    decoder.video_diag_packets_ = 0;
+    decoder.video_diag_decoded_frames_ = 0;
+    decoder.video_diag_rendered_frames_ = 0;
+    decoder.video_diag_late_drops_ = 0;
+    decoder.video_diag_large_pts_gap_count_ = 0;
+    decoder.video_diag_decoded_pts_interval_count_ = 0;
+    decoder.video_diag_decoded_pts_interval_sum_ms_ = 0.0;
+    decoder.video_diag_decoded_pts_interval_min_ms_ = 0.0;
+    decoder.video_diag_decoded_pts_interval_max_ms_ = 0.0;
+    decoder.video_diag_packet_recv_gap_max_ms_ = 0.0;
+    decoder.video_diag_packet_pts_gap_max_ms_ = 0.0;
+    decoder.video_diag_packet_queue_wait_max_ms_ = 0.0;
+    decoder.video_diag_decode_max_ms_ = 0.0;
+    decoder.video_diag_frame_wait_max_ms_ = 0.0;
+    decoder.video_diag_frame_residence_max_ms_ = 0.0;
+    decoder.video_diag_schedule_late_max_ms_ = 0.0;
+    decoder.video_diag_callback_max_ms_ = 0.0;
+}
+
+void update_video_diag_max(Decoder& decoder, double& value, double sample, int64_t now_us) {
+    std::lock_guard<std::mutex> lock(decoder.video_diag_mutex_);
+    if (sample > value) {
+        value = sample;
+    }
+    maybe_flush_video_diag_locked(decoder, now_us);
+}
+}
+
+void Decoder::recordVideoPacket(int64_t recv_us, double pts_seconds) {
+    std::lock_guard<std::mutex> lock(video_diag_mutex_);
+    ++video_diag_packets_;
+    if (last_packet_recv_us_ > 0 && recv_us > last_packet_recv_us_) {
+        video_diag_packet_recv_gap_max_ms_ = std::max(
+                video_diag_packet_recv_gap_max_ms_,
+                (recv_us - last_packet_recv_us_) / 1000.0);
+    }
+    last_packet_recv_us_ = recv_us;
+
+    if (!std::isnan(pts_seconds)) {
+        if (has_last_packet_pts_) {
+            const double gap_ms = (pts_seconds - last_packet_pts_seconds_) * 1000.0;
+            if (gap_ms > 0.0) {
+                video_diag_packet_pts_gap_max_ms_ = std::max(video_diag_packet_pts_gap_max_ms_, gap_ms);
+                if (gap_ms > kLargePtsGapThresholdMs) {
+                    ++video_diag_large_pts_gap_count_;
+                }
+            }
+        }
+        last_packet_pts_seconds_ = pts_seconds;
+        has_last_packet_pts_ = true;
+    }
+    maybe_flush_video_diag_locked(*this, recv_us);
+}
+
+void Decoder::recordDecodedFrame(int64_t pts, AVRational frame_time_base) {
+    const int64_t now_us = av_gettime_relative();
+    std::lock_guard<std::mutex> lock(video_diag_mutex_);
+    ++video_diag_decoded_frames_;
+
+    if (pts != AV_NOPTS_VALUE && frame_time_base.num > 0 && frame_time_base.den > 0) {
+        if (last_decoded_pts_ != AV_NOPTS_VALUE && pts > last_decoded_pts_) {
+            const double interval_ms = (pts - last_decoded_pts_) * av_q2d(frame_time_base) * 1000.0;
+            // Ignore large timestamp jumps (for example, after a stream switch) in cadence stats.
+            if (interval_ms > 0.0 && interval_ms <= 1000.0) {
+                if (video_diag_decoded_pts_interval_count_ == 0) {
+                    video_diag_decoded_pts_interval_min_ms_ = interval_ms;
+                    video_diag_decoded_pts_interval_max_ms_ = interval_ms;
+                } else {
+                    video_diag_decoded_pts_interval_min_ms_ = std::min(
+                            video_diag_decoded_pts_interval_min_ms_, interval_ms);
+                    video_diag_decoded_pts_interval_max_ms_ = std::max(
+                            video_diag_decoded_pts_interval_max_ms_, interval_ms);
+                }
+                video_diag_decoded_pts_interval_sum_ms_ += interval_ms;
+                ++video_diag_decoded_pts_interval_count_;
+            }
+        }
+        if (last_decoded_pts_ == AV_NOPTS_VALUE || pts > last_decoded_pts_) {
+            last_decoded_pts_ = pts;
+        }
+    }
+    maybe_flush_video_diag_locked(*this, now_us);
+}
+
+void Decoder::recordRenderedFrame() {
+    const int64_t now_us = av_gettime_relative();
+    std::lock_guard<std::mutex> lock(video_diag_mutex_);
+    ++video_diag_rendered_frames_;
+    maybe_flush_video_diag_locked(*this, now_us);
+}
+
+void Decoder::recordLateDrop() {
+    const int64_t now_us = av_gettime_relative();
+    std::lock_guard<std::mutex> lock(video_diag_mutex_);
+    ++video_diag_late_drops_;
+    maybe_flush_video_diag_locked(*this, now_us);
+}
+
+void Decoder::recordPacketQueueWait(double wait_ms) {
+    update_video_diag_max(*this, video_diag_packet_queue_wait_max_ms_, wait_ms, av_gettime_relative());
+}
+
+void Decoder::recordDecodeCost(double cost_ms) {
+    update_video_diag_max(*this, video_diag_decode_max_ms_, cost_ms, av_gettime_relative());
+}
+
+void Decoder::recordFrameQueueWait(double wait_ms) {
+    update_video_diag_max(*this, video_diag_frame_wait_max_ms_, wait_ms, av_gettime_relative());
+}
+
+void Decoder::recordFrameResidence(double residence_ms) {
+    update_video_diag_max(*this, video_diag_frame_residence_max_ms_, residence_ms, av_gettime_relative());
+}
+
+void Decoder::recordScheduleLate(double late_ms) {
+    if (late_ms > 0.0) {
+        update_video_diag_max(*this, video_diag_schedule_late_max_ms_, late_ms, av_gettime_relative());
+    }
+}
+
+void Decoder::recordCallbackCost(double cost_ms) {
+    update_video_diag_max(*this, video_diag_callback_max_ms_, cost_ms, av_gettime_relative());
+}
+
 
 int Decoder::decoder_start( const char *thread_name)
 {
@@ -97,7 +265,7 @@ int Decoder::video_thread()
                 av_frame_unref(frame);
                 continue;
             }
-            frame_queue_push(framequeue, queued_frame);
+            frame_queue_push(framequeue, queued_frame, av_gettime_relative());
         }
         av_frame_unref(frame);
     }
@@ -120,8 +288,12 @@ static constexpr double kNormalLateFrames = 1.8;
 static constexpr double kBacklogLateFrames = 1.0;
 static constexpr double kBacklogSleepFactor = 0.25;
 static constexpr double kMinSleepCapSec = 0.004;
-#define QUEUE_WM_MID 6             // 中水位：12 帧队列的 50%，开始缩短休眠
-#define QUEUE_WM_HIGH 9            // 高水位：12 帧队列的 75%，跳过休眠快速追帧
+// 平滑优先档：显示延迟预算。允许帧最多迟到 budget 再判晚到，
+// 用缓冲帧桥接 TCP 慢启动/突发造成的到达间隙，换取播放节奏平滑
+// （代价：端到端延迟 + budget，详见 TCP卡顿与UDP流畅分析.md）。
+static constexpr double kDisplayBudgetSec = 0.066;   // ≈ 2 帧 @30fps
+#define QUEUE_WM_MID 6             // 中水位：8 帧队列的 75%，开始缩短休眠
+#define QUEUE_WM_HIGH 7            // 高水位：8 帧队列的 87.5%，跳过休眠快速追帧
 
 static inline double now_seconds() {
     return av_gettime_relative() / 1000000.0;
@@ -161,8 +333,15 @@ int Decoder::video_refresh_thread(FrameQueue *fq)
 
 
     while (!fq->abort_request) {
-        AVFrame *frame = frame_queue_pop(fq);
+        const int64_t frame_wait_start_us = av_gettime_relative();
+        int64_t frame_enqueue_us = 0;
+        AVFrame *frame = frame_queue_pop(fq, &frame_enqueue_us);
+        const int64_t frame_pop_us = av_gettime_relative();
+        recordFrameQueueWait((frame_pop_us - frame_wait_start_us) / 1000.0);
         if (!frame) continue;
+        if (frame_enqueue_us > 0) {
+            recordFrameResidence((frame_pop_us - frame_enqueue_us) / 1000.0);
+        }
         const int current_generation = fq->generation.load();
         //当两者不一样的时候，说明已经切到了新流，重置状态，防止新旧流PTS 不连续造成播放卡顿
         if (current_generation != session_generation) {
@@ -207,16 +386,19 @@ int Decoder::video_refresh_thread(FrameQueue *fq)
         double pts_s = (frame->pts - session_base_pts) * av_q2d(time_base);
         double now = now_seconds();
         if (std::isnan(last_frame_pts)) {
+            // 平滑优先：首帧延迟 budget 再出（攒出缓冲深度），起播/切流后预算立即生效。
+            av_usleep((int64_t)(kDisplayBudgetSec * 1000000));
+            now = now_seconds();
             frame_timer = now;
             last_frame_pts = pts_s;
 
             const double callback_start = now_seconds();
-            mVideoCallback(frame, pts_s);
+            const int callback_ret = mVideoCallback(frame, pts_s);
             const double callback_end = now_seconds();
-            LOGD_PLAYER(owner_player_id_,
-                        "mVideoCallback first frame: pts_s=%f, start=%f, end=%f, cost_ms=%.3f",
-                        pts_s, callback_start, callback_end,
-                        (callback_end - callback_start) * 1000.0);
+            recordCallbackCost((callback_end - callback_start) * 1000.0);
+            if (callback_ret >= 0) {
+                recordRenderedFrame();
+            }
             frame_pool_release(&framePool_, frame);
             continue;
         }
@@ -237,10 +419,14 @@ int Decoder::video_refresh_thread(FrameQueue *fq)
         渲染线程自己被阻塞了：哪怕队列里只有 1-2 帧，如果渲染线程被别的事情卡住了，比如 Java 层回调、锁竞争、主线程处理慢，等它恢复时这帧已经错过显示时机了
  */
         // 过期帧直接丢掉，但是要推进时间轴，防止连续丢帧。
-        if (now - target_time > late_threshold) {
+        // 平滑优先：允许帧最多迟到 kDisplayBudgetSec 再判晚到——
+        // 预算内的到达间隙用缓冲帧桥接，超出预算才丢帧追实时。
+        if (now - target_time > late_threshold + kDisplayBudgetSec) {
+            recordScheduleLate((now - target_time) * 1000.0);
             frame_timer = now;
             last_frame_pts = pts_s;
             frame_queue_record_late_drop(fq);
+            recordLateDrop();
             frame_pool_release(&framePool_, frame);
             LOG_QUEUE_PLAYER(owner_player_id_, "drop late frame, late=%f, threshold=%f, backlog=%d",
                       now - target_time, late_threshold, queue_backlog);
@@ -265,13 +451,14 @@ int Decoder::video_refresh_thread(FrameQueue *fq)
 
         //先渲染
         const double callback_start = now_seconds();
-        mVideoCallback(frame,pts_s);
+        recordScheduleLate((callback_start - target_time) * 1000.0);
+        const int callback_ret = mVideoCallback(frame, pts_s);
         const double callback_end = now_seconds();
-        LOGD_PLAYER(owner_player_id_,
-                    "mVideoCallback: pts_s=%f, backlog=%d, target_time=%f, start=%f, end=%f, cost_ms=%.3f",
-                    pts_s, queue_backlog, target_time, callback_start, callback_end,
-                    (callback_end - callback_start) * 1000.0);
-        frame_queue_record_render(fq);
+        recordCallbackCost((callback_end - callback_start) * 1000.0);
+        if (callback_ret >= 0) {
+            recordRenderedFrame();
+            frame_queue_record_render(fq);
+        }
         // 到时间了 → 更新 frame_timer
         frame_timer = callback_end;
         last_frame_pts = pts_s;
@@ -298,9 +485,12 @@ int Decoder::decoder_decode_frame(AVFrame * frame)
             std::lock_guard<std::mutex> lock(decoder_mutex_);
             do {
                 if (avctx_->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    const int64_t decode_start_us = av_gettime_relative();
                     ret = avcodec_receive_frame(avctx_, frame);
+                    recordDecodeCost((av_gettime_relative() - decode_start_us) / 1000.0);
                     if (ret >= 0) {
                         frame->pts = frame->best_effort_timestamp;
+                        recordDecodedFrame(frame->pts, avctx_->pkt_timebase);
                     }
                 }
                 // 1.3. 检查解码是否已经结束，解码结束返回0
@@ -324,9 +514,11 @@ int Decoder::decoder_decode_frame(AVFrame * frame)
         }
 
         if (!has_pending_packet) {
+            const int64_t packet_wait_start_us = av_gettime_relative();
             if (packet_queue_get(queue_, &pkt, 1) < 0) {
                 return -1;
             }
+            recordPacketQueueWait((av_gettime_relative() - packet_wait_start_us) / 1000.0);
         }
 
         {
@@ -337,7 +529,9 @@ int Decoder::decoder_decode_frame(AVFrame * frame)
                 return 0;
             }
 
+            const int64_t decode_start_us = av_gettime_relative();
             int result = avcodec_send_packet(avctx_, &pkt);
+            recordDecodeCost((av_gettime_relative() - decode_start_us) / 1000.0);
             if (result == AVERROR(EAGAIN)) {
                 packet_pending_ = 1;
                 av_packet_move_ref(&pkt_, &pkt);

@@ -3,6 +3,7 @@
 
 #include "ffplay_def.h"
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -36,6 +37,32 @@ public:
     std::atomic<bool> switching_{false};
     std::mutex output_mutex_;
     int session_generation = -1;
+
+    // Low-frequency video pipeline diagnostics.  Values are accumulated in
+    // memory and emitted at most once per second to avoid logcat I/O jitter.
+    std::mutex video_diag_mutex_;
+    int64_t video_diag_window_start_us_ = 0;
+    int64_t last_packet_recv_us_ = 0;
+    double last_packet_pts_seconds_ = 0.0;
+    bool has_last_packet_pts_ = false;
+    int video_diag_packets_ = 0;
+    int video_diag_decoded_frames_ = 0;
+    int video_diag_rendered_frames_ = 0;
+    int video_diag_late_drops_ = 0;
+    int video_diag_large_pts_gap_count_ = 0;
+    int64_t last_decoded_pts_ = AV_NOPTS_VALUE;
+    int video_diag_decoded_pts_interval_count_ = 0;
+    double video_diag_decoded_pts_interval_sum_ms_ = 0.0;
+    double video_diag_decoded_pts_interval_min_ms_ = 0.0;
+    double video_diag_decoded_pts_interval_max_ms_ = 0.0;
+    double video_diag_packet_recv_gap_max_ms_ = 0.0;
+    double video_diag_packet_pts_gap_max_ms_ = 0.0;
+    double video_diag_packet_queue_wait_max_ms_ = 0.0;
+    double video_diag_decode_max_ms_ = 0.0;
+    double video_diag_frame_wait_max_ms_ = 0.0;
+    double video_diag_frame_residence_max_ms_ = 0.0;
+    double video_diag_schedule_late_max_ms_ = 0.0;
+    double video_diag_callback_max_ms_ = 0.0;
 
     void decoder_abort();
     // 切流时清空队列并刷新解码器，但不退出常驻线程。
@@ -78,6 +105,17 @@ public:
     void setOwnerPlayerId(int playerId) {
         owner_player_id_ = playerId;
     }
+
+    void recordVideoPacket(int64_t recvUs, double ptsSeconds);
+    void recordDecodedFrame(int64_t pts, AVRational frameTimeBase);
+    void recordRenderedFrame();
+    void recordLateDrop();
+    void recordPacketQueueWait(double waitMs);
+    void recordDecodeCost(double costMs);
+    void recordFrameQueueWait(double waitMs);
+    void recordFrameResidence(double residenceMs);
+    void recordScheduleLate(double lateMs);
+    void recordCallbackCost(double costMs);
 
 
 

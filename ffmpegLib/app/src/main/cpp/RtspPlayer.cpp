@@ -20,28 +20,38 @@ namespace {
 constexpr int kInitialWidth = 2560;
 constexpr int kInitialHeight = 1440;
 
-JNIEnv* getJNIEnv(JavaVM* jvm, bool* needDetach = nullptr) {
+// R8 优化：每个 native 线程首次使用 JNI 时 Attach 一次并缓存（thread_local），
+// 线程退出时由析构自动 Detach，避免每帧/每 SEI 包反复 Attach/Detach 的固定开销。
+// 只有我们主动 Attach 的线程才负责 Detach；Java 发起的线程（GetEnv 直接成功）不能 Detach。
+struct ThreadJniGuard {
+    JavaVM* vm = nullptr;
+    JNIEnv* env = nullptr;
+    bool attachedByUs = false;
+    ~ThreadJniGuard() {
+        if (vm && attachedByUs) {
+            vm->DetachCurrentThread();
+        }
+    }
+};
+
+thread_local ThreadJniGuard tJni;
+
+JNIEnv* getJNIEnvCached(JavaVM* jvm) {
     if (!jvm) {
         return nullptr;
     }
 
-    JNIEnv* env = nullptr;
-    const int status = jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
-    if (status == JNI_OK) {
-        if (needDetach) {
-            *needDetach = false;
+    if (tJni.vm != jvm) {
+        if (jvm->GetEnv(reinterpret_cast<void**>(&tJni.env), JNI_VERSION_1_6) == JNI_OK) {
+            tJni.vm = jvm;
+        } else if (jvm->AttachCurrentThread(&tJni.env, nullptr) == JNI_OK) {
+            tJni.vm = jvm;
+            tJni.attachedByUs = true;
+        } else {
+            return nullptr;
         }
-        return env;
     }
-
-    if (status == JNI_EDETACHED && jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
-        if (needDetach) {
-            *needDetach = true;
-        }
-        return env;
-    }
-
-    return nullptr;
+    return tJni.env;
 }
 
 
@@ -306,8 +316,7 @@ RtspPlayer::~RtspPlayer() {
         LOGD_PLAYER(playerId_, "~RtspPlayer after readThread join");
     }
 
-    bool needDetach = false;
-    JNIEnv* env = getJNIEnv(jvm_, &needDetach);
+    JNIEnv* env = getJNIEnvCached(jvm_);
     LOGD_PLAYER(playerId_, "start to release");
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
@@ -323,9 +332,6 @@ RtspPlayer::~RtspPlayer() {
         if (env) {
             releaseCallbackRefs(env);
         }
-    }
-    if (env && needDetach) {
-        jvm_->DetachCurrentThread();
     }
 }
 
@@ -458,6 +464,14 @@ void RtspPlayer::stop() {
     requestStop();
 }
 
+void RtspPlayer::startRecord(const std::string& filePath) {
+    rawDumper_.startRecord(playerId_, filePath);
+}
+
+void RtspPlayer::stopRecord() {
+    rawDumper_.stop();
+}
+
 //保存当前 RTSP URL，设置暂停状态，请求读包线程退出，中断 av_read_frame()，关闭 RTSP 网络连接，清理播放队列
 void RtspPlayer::pauseForBandwidth() {
     bool shouldRequestStop = false;
@@ -564,16 +578,12 @@ int RtspPlayer::handleFrame(const AVFrame* frame, double ptsSeconds) {
         return -1;
     }
 
-    bool needDetach = false;
-    JNIEnv* env = getJNIEnv(jvm_, &needDetach);
+    JNIEnv* env = getJNIEnvCached(jvm_);
     if (!env) {
         return -1;
     }
 
     if (!frameBuffer_->copyFromFrame(frame)) {
-        if (needDetach) {
-            jvm_->DetachCurrentThread();
-        }
         return -1;
     }
     jobject byteBuffer = frameBuffer_->getDirectByteBuffer(env);
@@ -590,10 +600,6 @@ int RtspPlayer::handleFrame(const AVFrame* frame, double ptsSeconds) {
     if (env->ExceptionCheck()) {
         env->ExceptionDescribe();
         env->ExceptionClear();
-    }
-
-    if (needDetach) {
-        jvm_->DetachCurrentThread();
     }
 
     return 0;
@@ -655,10 +661,18 @@ void RtspPlayer::readThreadLoop() {
 
                 case ReadState::Connecting: {
                     AVDictionary* opts = nullptr;
+                    // TCP 传输：RTP 走 RTSP interleaved 通道，内核保证有序可靠，
+                    // 丢包重传由 TCP 负责（弱网不花屏，代价是延迟和带宽开销）。
+                    // 控制通道（DESCRIBE/SETUP/PLAY + SDP）同样走 TCP。
                     av_dict_set(&opts, "rtsp_transport", "tcp", 0);
                     av_dict_set(&opts, "stimeout", "3000000", 0);
                     av_dict_set(&opts, "probesize", "512000", 0);      // 512KB
-                    av_dict_set(&opts, "analyzeduration", "300000", 0); // 300ms
+                    av_dict_set(&opts, "analyzeduration", "200000", 0); // 200ms
+                    // reorder_queue_size 仅 UDP 模式生效，TCP 下被 FFmpeg 忽略，保留无害。
+                    av_dict_set(&opts, "reorder_queue_size", "100", 0); //设置UDP重排队列大小
+                    av_dict_set(&opts, "buffer_size", "524288", 0); // 500KB socket buffer
+
+
 
                     armInterruptTimeout(kConnectInterruptTimeoutUs);
                     int ret = avformat_open_input(&fmtCtx, rtspUrl_.c_str(), nullptr, &opts);
@@ -707,6 +721,8 @@ void RtspPlayer::readThreadLoop() {
                     }
 
                     videoDecoder_.time_base = fmtCtx->streams[videoStreamIndex]->time_base;
+                    // 流会话开始：缓存本流参数；若录制已激活则创建/续写本会话的录制文件。
+                    rawDumper_.openForStream(fmtCtx->streams[videoStreamIndex]->codecpar);
                     ret = streamComponentOpen(videoStreamIndex, fmtCtx);
                     if (ret < 0) {
                         reportFfmpegError(ret);
@@ -850,7 +866,27 @@ ReadExitReason RtspPlayer::readPacketLoop(AVFormatContext* fmtCtx, int videoStre
 
         if (pkt->stream_index == videoStreamIndex) {
             //更新最近一帧视频的时间
-            lastVideoPacketRecvUs_.store(nowMonotonicUs());
+            // Log timestamps at demux input so PTS discontinuities can be
+            // distinguished from drops introduced later by decode or render.
+            const int64_t packetRecvUs = nowMonotonicUs();
+            const AVRational timeBase = fmtCtx->streams[videoStreamIndex]->time_base;
+            const double ptsSeconds = pkt->pts == AV_NOPTS_VALUE
+                                      ? NAN
+                                      : pkt->pts * av_q2d(timeBase);
+            
+           
+            videoDecoder_.recordVideoPacket(packetRecvUs, ptsSeconds);
+            // 原始码流录制：放在关键帧门控之前，拿到什么存什么（含会被门控丢弃的包）。
+            rawDumper_.writePacket(pkt, packetRecvUs);
+            LOG_FRAME_PLAYER(playerId_,
+                             "video packet: recv_us=%lld pts=%lld(%.6f)"
+                             "size=%d flags=0x%x tb=%d/%d",
+                             static_cast<long long>(packetRecvUs),
+                             static_cast<long long>(pkt->pts), ptsSeconds,
+                             
+                             pkt->size, pkt->flags, timeBase.num, timeBase.den);
+
+            lastVideoPacketRecvUs_.store(packetRecvUs);
             videoPacketTimeoutWarned_.store(false);
             if (waitVideoKeyFrame && !(pkt->flags & AV_PKT_FLAG_KEY)) {
             LOG_QUEUE_PLAYER(playerId_, "drop non-key packet while waiting for stream start key frame");
@@ -970,6 +1006,8 @@ bool RtspPlayer::canReuseDecoderForStream(AVFormatContext* fmtCtx, int streamInd
     -> 创建一个新的 AVCodecContext
    如果 videoDecoder_ 里已经有 avctx_，并且新流参数一致
     -> 继续复用这个 avctx_
+   如果 videoDecoder_ 里已经有 avctx_，但新流参数不兼容
+    -> 停掉旧线程、释放旧 AVCodecContext 后重建（teardown + rebuild）
  */
 int RtspPlayer::ensureDecoderForStream(AVFormatContext* fmtCtx, int streamIndex) {
     if (!fmtCtx || streamIndex < 0 || streamIndex >= static_cast<int>(fmtCtx->nb_streams)) {
@@ -1116,8 +1154,7 @@ void RtspPlayer::notifyJavaError(int errorCode) {
         return;
     }
 
-    bool needDetach = false;
-    JNIEnv* env = getJNIEnv(jvm_, &needDetach);
+    JNIEnv* env = getJNIEnvCached(jvm_);
     if (!env) {
         return;
     }
@@ -1127,10 +1164,6 @@ void RtspPlayer::notifyJavaError(int errorCode) {
         env->ExceptionDescribe();
         env->ExceptionClear();
     }
-
-    if (needDetach) {
-        jvm_->DetachCurrentThread();
-    }
 }
 
 void RtspPlayer::notifySeiToJava(const uint8_t* sei, int size) {
@@ -1138,26 +1171,37 @@ void RtspPlayer::notifySeiToJava(const uint8_t* sei, int size) {
         return;
     }
 
-    bool needDetach = false;
-    JNIEnv* env = getJNIEnv(jvm_, &needDetach);
+    JNIEnv* env = getJNIEnvCached(jvm_);
     if (!env) {
         return;
     }
 
-    jbyteArray array = env->NewByteArray(size);
-    if (array) {
-        env->SetByteArrayRegion(array, 0, size, reinterpret_cast<const jbyte*>(sei));
-        env->CallVoidMethod(callbackGlobalRef_, onSeiMethod_, array);
-        env->DeleteLocalRef(array);
+    // R8 优化：复用全局 byte[] 缓冲回调 SEI，稳态零分配；容量不够才扩容（罕见路径）。
+    // 注意契约：Java 侧拿到的是复用缓冲，回调返回后内容会被下一次覆盖，要保留必须当场拷贝。
+    if (seiBufGlobalRef_ == nullptr || size > seiBufCapacity_) {
+        constexpr int kSeiBufInitialCapacity = 4096;
+        const int capacity = size > kSeiBufInitialCapacity ? size : kSeiBufInitialCapacity;
+        jbyteArray buf = env->NewByteArray(capacity);
+        if (!buf) {
+            return;
+        }
+        if (seiBufGlobalRef_) {
+            env->DeleteGlobalRef(seiBufGlobalRef_);
+            seiBufGlobalRef_ = nullptr;
+        }
+        seiBufGlobalRef_ = static_cast<jbyteArray>(env->NewGlobalRef(buf));
+        seiBufCapacity_ = capacity;
+        env->DeleteLocalRef(buf);
+        if (!seiBufGlobalRef_) {
+            return;
+        }
     }
 
+    env->SetByteArrayRegion(seiBufGlobalRef_, 0, size, reinterpret_cast<const jbyte*>(sei));
+    env->CallVoidMethod(callbackGlobalRef_, onSeiMethod_, seiBufGlobalRef_);
     if (env->ExceptionCheck()) {
         env->ExceptionDescribe();
         env->ExceptionClear();
-    }
-
-    if (needDetach) {
-        jvm_->DetachCurrentThread();
     }
 }
 
@@ -1167,7 +1211,8 @@ void RtspPlayer::reportFfmpegError(int ffErr) {
 
 
 // 先把码流里为了防止误识别 start code 而插入的 0x03 去掉，再按真SEI 数据格式解析
-// 只有 payloadType=5(user_data_unregistered) 时，才打印业务日志并回调 Java
+// 每个 SEI NALU(type 39/40) 解析完后，都会把去掉 emulation prevention byte 的整段 SEI RBSP 回调给 Java，
+// 业务侧可在其中按 payloadType=5(user_data_unregistered) 的前 16 字节 UUID 区分具体类型
 //一个pkt里面可能有很多NALU，每个NALU里又可能有多个payload，所以要循环解析
 bool RtspPlayer::extractHevcSeiAndCallback(const uint8_t* data, int size) {
     if (!data || size <= 0) {
@@ -1247,10 +1292,8 @@ bool RtspPlayer::extractHevcSeiAndCallback(const uint8_t* data, int size) {
                             break;
                         }
 
-                        // ===== 解析 user_data_unregistered =====
                         // 业务相关的 SEI 数据通常放在 payloadType=5 的 user_data_unregistered 里，且前16字节是 UUID，可以用来区分不同类型的 SEI。
-                        if (payloadType == 5 && payloadSize > 16) {
-                        }
+                        // 当前实现不对 payloadType 做过滤，解析完 payload 列表后把整段 SEI RBSP 回调给 Java。
 
                         // 👉 跳到下一个 payload
                         offset += payloadSize;
@@ -1288,6 +1331,12 @@ void RtspPlayer::releaseCallbackRefs(JNIEnv* env) {
         callbackClassGlobalRef_ = nullptr;
     }
 
+    if (seiBufGlobalRef_) {
+        env->DeleteGlobalRef(seiBufGlobalRef_);
+        seiBufGlobalRef_ = nullptr;
+        seiBufCapacity_ = 0;
+    }
+
     onErrorMethod_ = nullptr;
     onSeiMethod_ = nullptr;
     onI420DataMethod_ = nullptr;
@@ -1308,6 +1357,8 @@ void RtspPlayer::cleanupPlaybackState(AVFormatContext** fmtCtx) {
         packet_queue_flush(&videoQueue_);
         frame_queue_flush(&frameQueue_);
     }
+    // 本流会话结束：flush 录制文件；若录制仍处于激活状态，下一个流会话继续追加同一文件。
+    rawDumper_.closeForStream();
     LOGD_PLAYER(playerId_, "cleanupPlaybackState");
 }
 

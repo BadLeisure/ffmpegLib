@@ -3,8 +3,31 @@
 #define LOG_TAG "FrameQueue"
 #include "native_log.h"
 
+extern "C" {
+#include "libavutil/time.h"
+}
+
 namespace {
 constexpr std::memory_order kQueueStateOrder = std::memory_order_relaxed;
+
+// 溢出时清空整队，返回丢弃的包数。调用方必须已持有 q->mutex。
+// 丢弃的包都是解码器尚未消费的旧包，配合紧随其后入队的关键帧，
+// 解码器视角为"消费完旧流后从新 IDR 干净重启"，无引用断裂、不产生额外花屏。
+int64_t packet_queue_drop_all_locked(PacketQueue *q) {
+    const int64_t dropped = q->nb_packets;
+    MyAVPacketList *pkt, *pkt1;
+    for (pkt = q->first_pkt; pkt; pkt = pkt1) {
+        pkt1 = pkt->next;
+        av_packet_unref(&pkt->pkt);
+        av_freep(&pkt);
+    }
+    q->first_pkt = nullptr;
+    q->last_pkt = nullptr;
+    q->nb_packets = 0;
+    q->size = 0;
+    q->duration = 0;
+    return dropped;
+}
 
 // 统一释放队列里的 AVFrame。
 // 如果当前 FrameQueue 绑定了对象池，就回收到对象池；
@@ -48,9 +71,11 @@ void erase_logical_pos_locked(FrameQueue* fq, int logical_pos) {
         const int from = (fq->rindex + i + 1) % fq->max_size;
         const int to = (fq->rindex + i) % fq->max_size;
         fq->queue[to] = fq->queue[from];
+        fq->enqueue_us[to] = fq->enqueue_us[from];
     }
     const int tail_idx = (fq->rindex + size - 1) % fq->max_size;
     fq->queue[tail_idx] = nullptr;
+    fq->enqueue_us[tail_idx] = 0;
     fq->size.store(size - 1, kQueueStateOrder);
     fq->windex = (fq->rindex + size - 1) % fq->max_size;
 }
@@ -90,6 +115,7 @@ static constexpr int kDropBudgetIncomingI = 3;
 void frame_queue_rebuild_locked(FrameQueue* fq, AVFrame* const* kept, int kept_count) {
     for (int i = 0; i < fq->max_size; ++i) {
         fq->queue[i] = nullptr;
+        fq->enqueue_us[i] = 0;
     }
 
     fq->rindex = 0;
@@ -97,6 +123,7 @@ void frame_queue_rebuild_locked(FrameQueue* fq, AVFrame* const* kept, int kept_c
     fq->windex = kept_count % fq->max_size;
     for (int i = 0; i < kept_count; ++i) {
         fq->queue[i] = kept[i];
+        fq->enqueue_us[i] = 0;
     }
 }
 
@@ -159,6 +186,41 @@ int packet_queue_put(PacketQueue *q, AVPacket *pkt)
     {
         // std::lock_guard 在作用域结束时自动释放锁
         std::lock_guard<std::mutex> lock(q->mutex);
+        // 受控丢包（内存防护）：解码/渲染停滞导致队列堆积到高水位时，在唯一的生产入口限流，
+        // 防止无界增长拖垮内存。仅对真实数据包生效（空包 size=0 不参与，flush 哨兵不走这里）。
+        if (pkt1->data != nullptr &&
+            (q->size >= q->max_size || q->nb_packets >= q->max_packets)) {
+            const bool incoming_is_key = (pkt1->flags & AV_PKT_FLAG_KEY) != 0;
+            const int64_t now_us = av_gettime_relative();
+            if (!incoming_is_key) {
+                // 非关键帧：直接丢弃，解码器永远看不到，不产生额外花屏，队列停止增长。
+                q->overflow_drops++;
+                if (!q->overflow_active) {
+                    q->overflow_active = true;
+                    q->last_overflow_log_us = now_us;
+                    LOGW_PLAYER(q->owner_player_id,
+                         "packet queue overflow start, size=%d bytes, packets=%d, drop incoming non-key packet",
+                         q->size, q->nb_packets);
+                } else if (now_us - q->last_overflow_log_us >= 2000000) {
+                    q->last_overflow_log_us = now_us;
+                    LOGW_PLAYER(q->owner_player_id,
+                         "packet queue overflow, drops=%lld, size=%d bytes, packets=%d",
+                         static_cast<long long>(q->overflow_drops), q->size, q->nb_packets);
+                }
+                av_packet_free(&pkt1);
+                return 0; // 主动丢弃，不算调用方错误
+            }
+
+            // 关键帧到达：清空整队后入队，解码器从新 IDR 干净重启。
+            const int64_t dropped = packet_queue_drop_all_locked(q);
+            q->overflow_drops += dropped;
+            q->overflow_active = true;
+            q->last_overflow_log_us = now_us;
+            LOGW_PLAYER(q->owner_player_id,
+                 "packet queue overflow, flush %lld stale packets on incoming key frame, drops=%lld",
+                 static_cast<long long>(dropped),
+                 static_cast<long long>(q->overflow_drops));
+        }
         ret = packet_queue_put_private(q, pkt1); // 主要实现
     }
 
@@ -232,6 +294,10 @@ void packet_queue_flush(PacketQueue *q)
         q->nb_packets = 0;
         q->size = 0;
         q->duration = 0;
+        // flush 意味着一次流会话结束，溢出 episode 随之复位。
+        q->overflow_drops = 0;
+        q->overflow_active = false;
+        q->last_overflow_log_us = 0;
     }
     LOGD_PLAYER(q->owner_player_id, "packet_queue_flush over");
 }
@@ -354,6 +420,15 @@ int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block)
                 q->cond.wait(lock);  // 等待条件变量通知
             }
         }
+
+        // 消费把队列拉回低水位（字节数和包数均低于高水位一半）：本次溢出 episode 结束。
+        if (ret > 0 && q->overflow_active &&
+            q->size < q->max_size / 2 && q->nb_packets < q->max_packets / 2) {
+            q->overflow_active = false;
+            LOGD_PLAYER(q->owner_player_id,
+                 "packet queue overflow recovered, drops=%lld, size=%d bytes",
+                 static_cast<long long>(q->overflow_drops), q->size);
+        }
     }
     return ret;
 }
@@ -365,6 +440,7 @@ int frame_queue_init(FrameQueue* fq, int max_size) {
     }
     for (int i = 0; i < VIDEO_PICTURE_QUEUE_SIZE; ++i) {
         fq->queue[i] = nullptr;
+        fq->enqueue_us[i] = 0;
     }
     fq->rindex = 0;
     fq->windex = 0;
@@ -394,6 +470,7 @@ void frame_queue_destroy(FrameQueue* fq) {
             release_frame_to_pool(fq, fq->queue[i]);
             fq->queue[i] = nullptr;
         }
+        fq->enqueue_us[i] = 0;
     }
     fq->size.store(0, kQueueStateOrder);
     fq->rindex = 0;
@@ -441,6 +518,7 @@ void frame_queue_flush(FrameQueue* fq) {
             release_frame_to_pool(fq, fq->queue[i]);
             fq->queue[i] = nullptr;
         }
+        fq->enqueue_us[i] = 0;
     }
     fq->size.store(0, kQueueStateOrder);
     fq->rindex = 0;
@@ -464,7 +542,7 @@ int frame_queue_size(FrameQueue* fq) {
     return fq->size.load(kQueueStateOrder);
 }
 
-void frame_queue_push(FrameQueue *fq,AVFrame* frame) {
+void frame_queue_push(FrameQueue *fq, AVFrame* frame, int64_t enqueue_us) {
     if (!fq) {
         av_frame_free(&frame);
         return;
@@ -539,6 +617,7 @@ void frame_queue_push(FrameQueue *fq,AVFrame* frame) {
         const int size_after_erase = fq->size.load(kQueueStateOrder);
         const int tail_idx = (fq->rindex + size_after_erase) % fq->max_size;
         fq->queue[tail_idx] = frame;
+        fq->enqueue_us[tail_idx] = enqueue_us;
         fq->size.store(size_after_erase + 1, kQueueStateOrder);
         fq->windex = (tail_idx + 1) % fq->max_size;
         const int drop_count = fq->drop.fetch_add(1, kQueueStateOrder) + 1;
@@ -549,13 +628,14 @@ void frame_queue_push(FrameQueue *fq,AVFrame* frame) {
     }
 
     fq->queue[fq->windex] = frame;
+    fq->enqueue_us[fq->windex] = enqueue_us;
     fq->windex = (fq->windex + 1) % fq->max_size;
     fq->size.fetch_add(1, kQueueStateOrder);
     fq->total.fetch_add(1, kQueueStateOrder);
     fq->frameCond.notify_one(); // 通知可能阻塞的 pop
 }
 
-AVFrame* frame_queue_pop(FrameQueue* fq) {
+AVFrame* frame_queue_pop(FrameQueue* fq, int64_t* enqueue_us) {
     if (!fq) {
         return nullptr;
     }
@@ -570,7 +650,11 @@ AVFrame* frame_queue_pop(FrameQueue* fq) {
 
     // 取出队列最前面的帧
     AVFrame* frame = fq->queue[fq->rindex];
+    if (enqueue_us) {
+        *enqueue_us = fq->enqueue_us[fq->rindex];
+    }
     fq->queue[fq->rindex] = nullptr;
+    fq->enqueue_us[fq->rindex] = 0;
 
     // 更新读索引
     fq->rindex = (fq->rindex + 1) % fq->max_size;

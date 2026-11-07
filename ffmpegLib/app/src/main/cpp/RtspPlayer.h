@@ -14,6 +14,7 @@
 #undef LOGD
 #include "ffplay.h"
 #include "native_error.h"
+#include "RawStreamDumper.h"
 
 extern "C" {
 #include "include/libavformat/avformat.h"
@@ -41,6 +42,12 @@ public:
     // 等待后台读包线程完成清理并回到 Idle。
     bool waitUntilIdle(int timeoutMs);
 
+    // 开始原始码流录制：filePath 为完整 ES 文件路径，同步写 <filePath>.csv sidecar；
+    // 切流/重连不断流不轮转、无大小上限，只有 stopRecord() 或播放器析构结束保存。
+    void startRecord(const std::string& filePath);
+    // 停止原始码流录制。
+    void stopRecord();
+
 private:
     enum class RetryReason {
         ConnectFailure,
@@ -51,8 +58,8 @@ private:
     void readThreadLoop();
     ReadExitReason readPacketLoop(AVFormatContext* fmtCtx, int videoStreamIndex);
     void resetHevcGateState();
-    // 为当前流准备一个常驻可复用的解码器。
-    // 后续会把 streamComponentOpen() 里的实现逐步挪到这里。
+    // 为当前流准备一个常驻可复用的解码器：
+    // 同参数时复用已有 AVCodecContext，参数不兼容时 teardown 后重建。
     int ensureDecoderForStream(AVFormatContext* fmtCtx, int streamIndex);
     // 判断当前解码器是否还能复用到新流。
     bool canReuseDecoderForStream(AVFormatContext* fmtCtx, int streamIndex) const;
@@ -103,6 +110,10 @@ private:
     jmethodID onErrorMethod_ = nullptr;
     jmethodID onSeiMethod_ = nullptr;
     jmethodID onI420DataMethod_ = nullptr;
+    // SEI 回调复用缓冲（全局引用），稳态零分配；Java 侧不得在回调返回后继续持有该数组
+    // （内容会被下一次回调覆盖），需要保留时必须当场拷贝。
+    jbyteArray seiBufGlobalRef_ = nullptr;
+    int seiBufCapacity_ = 0;
 
     std::unique_ptr<VideoFrameBuffer> frameBuffer_;
     std::thread readThread_;
@@ -110,12 +121,14 @@ private:
     std::atomic<bool> threadRunning_{false};
     std::atomic<PlayerState> state_{PlayerState::Idle};
 
-    // 每次切流都会重建这两条队列。
-    // 播放器创建时初始化，切流时只清空并复用。
+    // 播放器创建时初始化一次，析构时统一销毁；切流时只 flush 并复用，不再反复 init/destroy。
     PacketQueue videoQueue_{};
     FrameQueue frameQueue_{};
-    // 当前仍按播放周期管理解码器，后续会逐步改成常驻生命周期。
+    // 解码器由 ensureDecoderForStream() 管理生命周期：同参数切流复用已有 AVCodecContext，
+    // 参数不兼容时 teardown 后重建；decoder/refresh 线程首次启动后保持常驻。
     Decoder videoDecoder_{};
+    // 原始码流录制器（默认关闭，由 startRecord 开启，写调用方指定 ES 文件 + CSV sidecar）。
+    RawStreamDumper rawDumper_;
 
     int isRealtime_ = 0;
     int useHw_ = 0;

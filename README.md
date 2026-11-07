@@ -137,3 +137,8 @@ app/src/main/cpp/
 
 - 只有在新旧流 `codec_id`、`codec_type`、分辨率、像素格式、`extradata` 等参数一致时才复用 `AVCodecContext`
 - 如果线程仍在运行且参数不一致，目前不会在线重建 `AVCodecContext`，而是返回 `EAGAIN`，避免后台线程访问已释放的解码器上下文
+
+
+未来发展方向：
+1、地面端侧自主实时检测，摆脱对机载 SEI 数据的强依赖
+2、在 Android 拉流端接入 AI 超分，就能在本地将 720P 实时放大到 1080P 甚至 4K，让用户看到媲美原生高清的画质

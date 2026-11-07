@@ -159,6 +159,42 @@ extern "C" JNIEXPORT void JNICALL nativeDestroyPlayer(JNIEnv* env, jobject thiz,
     }
 }
 
+extern "C" JNIEXPORT void JNICALL nativeStartRecord(JNIEnv* env, jobject thiz, jlong handle, jstring jpath) {
+    std::shared_ptr<RtspPlayer> player;
+    {
+        std::lock_guard<std::mutex> lock(gRegistryMutex);
+        player = findPlayerLocked(static_cast<int64_t>(handle));
+    }
+    if (!player) {
+        LOGD("startRecord ignored because player is not initialized, handle=%lld",
+             static_cast<long long>(handle));
+        return;
+    }
+
+    const char* path = env->GetStringUTFChars(jpath, nullptr);
+    std::string pathString = path ? path : "";
+    if (path) {
+        env->ReleaseStringUTFChars(jpath, path);
+    }
+    player->startRecord(pathString);
+}
+
+extern "C" JNIEXPORT void JNICALL nativeStopRecord(JNIEnv* env, jobject thiz, jlong handle) {
+    (void)env;
+    (void)thiz;
+    std::shared_ptr<RtspPlayer> player;
+    {
+        std::lock_guard<std::mutex> lock(gRegistryMutex);
+        player = findPlayerLocked(static_cast<int64_t>(handle));
+    }
+    if (!player) {
+        LOGD("stopRecord ignored because player is not initialized, handle=%lld",
+             static_cast<long long>(handle));
+        return;
+    }
+    player->stopRecord();
+}
+
 int registerNativeMethods(JNIEnv* env, const char* className, JNINativeMethod* methods, int numMethods) {
     jclass clazz = env->FindClass(className);
     if (clazz == nullptr) {
@@ -182,6 +218,8 @@ static JNINativeMethod kMethods[] = {
         {"stopPlayer",    "(J)V",                           reinterpret_cast<void*>(nativeStopPlayer)},
         {"pauseAllRtsp",  "()Z",                            reinterpret_cast<void*>(nativePauseAllRtsp)},
         {"resumeAllRtsp", "()V",                            reinterpret_cast<void*>(nativeResumeAllRtsp)},
+        {"startRecord",   "(JLjava/lang/String;)V",         reinterpret_cast<void*>(nativeStartRecord)},
+        {"stopRecord",    "(J)V",                           reinterpret_cast<void*>(nativeStopRecord)},
         {"destroyPlayer", "(J)V",                           reinterpret_cast<void*>(nativeDestroyPlayer)},};
 
 jint JNI_OnLoad(JavaVM* vm, void* reserved) {

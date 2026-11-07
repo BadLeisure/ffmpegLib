@@ -4,9 +4,8 @@ plugins {
 
 android {
     namespace 'com.example.ffmpegndk'
-    compileSdk {
-        version = release(36)
-    }
+    ndkVersion '27.0.11902837'
+    compileSdk 36
 
     defaultConfig {
         applicationId "com.example.ffmpegndk"
@@ -35,9 +34,9 @@ android {
             externalNativeBuild {
                 cmake {
                     arguments "-DNATIVE_ENABLE_FRAME_TRACE=0",
-                            "-DNATIVE_ENABLE_QUEUE_TRACE=1",
+                            "-DNATIVE_ENABLE_QUEUE_TRACE=0",
                             "-DNATIVE_ENABLE_SEI_TRACE=0",
-                            "-DNATIVE_ENABLE_BUFFER_TRACE=1"
+                            "-DNATIVE_ENABLE_BUFFER_TRACE=0"
                 }
             }
         }

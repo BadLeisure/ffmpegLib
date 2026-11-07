@@ -39,6 +39,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         ffplay.cpp
         native_error.cpp
         VideoFrameBuffer.cpp
+        RawStreamDumper.cpp
         )
 
 # 接收 Gradle buildType 传入的 native 日志开关参数。

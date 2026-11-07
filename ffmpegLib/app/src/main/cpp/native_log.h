@@ -13,6 +13,8 @@
 
 #define LOGD_PLAYER(player_id, fmt, ...) \
     __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, "[player=%d] " fmt, player_id, ##__VA_ARGS__)
+#define LOGI_PLAYER(player_id, fmt, ...) \
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "[player=%d] " fmt, player_id, ##__VA_ARGS__)
 #define LOGW_PLAYER(player_id, fmt, ...) \
     __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "[player=%d] " fmt, player_id, ##__VA_ARGS__)
 #define LOG_FRAME_PLAYER(player_id, ...) do { if (kEnableFrameTraceLog) LOGD_PLAYER(player_id, __VA_ARGS__); } while (0)
