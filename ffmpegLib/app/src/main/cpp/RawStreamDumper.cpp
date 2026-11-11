@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <ctime>
 
 extern "C" {
 #include "include/libavutil/time.h"
@@ -142,13 +143,24 @@ void RawStreamDumper::writePacket(const AVPacket* pkt, int64_t recvUs) {
     ++packetCount_;
 
     if (csvFile_) {
+        // 现实时间列：写入瞬间的本地墙钟（av_gettime，epoch 微秒取本地时区），
+        // 便于 CSV 与 logcat 等墙钟时间戳的日志对齐；recv_us 保持单调钟不变。
+        const int64_t wallUs = av_gettime();
+        const time_t wallSecs = static_cast<time_t>(wallUs / 1000000);
+        const int wallMs = static_cast<int>((wallUs % 1000000) / 1000);
+        struct tm tmBuf {};
+        localtime_r(&wallSecs, &tmBuf);
+        char timeBuf[32];
+        snprintf(timeBuf, sizeof(timeBuf), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+                 tmBuf.tm_year + 1900, tmBuf.tm_mon + 1, tmBuf.tm_mday,
+                 tmBuf.tm_hour, tmBuf.tm_min, tmBuf.tm_sec, wallMs);
         if (pkt->pts == AV_NOPTS_VALUE) {
-            fprintf(csvFile_, "%lld,NA,%d,0x%x\n",
-                    static_cast<long long>(recvUs), pkt->size, pkt->flags);
+            fprintf(csvFile_, "%lld,NA,%d,0x%x,%s\n",
+                    static_cast<long long>(recvUs), pkt->size, pkt->flags, timeBuf);
         } else {
-            fprintf(csvFile_, "%lld,%lld,%d,0x%x\n",
+            fprintf(csvFile_, "%lld,%lld,%d,0x%x,%s\n",
                     static_cast<long long>(recvUs),
-                    static_cast<long long>(pkt->pts), pkt->size, pkt->flags);
+                    static_cast<long long>(pkt->pts), pkt->size, pkt->flags, timeBuf);
         }
     }
 
@@ -197,7 +209,7 @@ void RawStreamDumper::openFilesLocked(const AVCodecParameters* params) {
             writeExtradataLocked(params);
         }
         if (csvFile_) {
-            fprintf(csvFile_, "recv_us,pts,size,flags\n");
+            fprintf(csvFile_, "recv_us,pts,size,flags,recv_time\n");
         }
     }
     recordFreshFile_ = false;
