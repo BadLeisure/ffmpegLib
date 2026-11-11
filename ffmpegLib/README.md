@@ -43,3 +43,25 @@
 2、恢复硬解起播门控逻辑：
    1) 当启用 `hevc_mediacodec` 硬解时，送解码前会检测包内 `VPS/SPS/PPS` 与 `IRAP`；
    2) 只有参数集就绪且收到 `IRAP` 后才正式喂给硬解码器，避免切流或重连后硬解直接吃到无效起始包。
+0917:
+1、添加停止流/继续拉流的接口与 pendingUrl 语义：
+   1) 切流过程中收到的新地址保存为 pendingUrl，停止当前流后可从 pending 地址继续拉流；
+   2) 真正的 stop/destroy 会清除 pending 并彻底释放资源，不会自动重新拉流。
+1107:
+1、原始码流录制（RawStreamDumper）：
+   1) 新增 startRecord/stopRecord 接口，把收到的原始 ES 落盘为 H.265 裸流（调用方指定文件路径）；
+   2) 同步写 CSV 帧级流水（recv_us/pts/size/flags/recv_time），可与 video_diag、logcat 时间轴对齐；
+   3) 切流/重连不断流不轮转，无大小上限，仅 stopRecord 或析构结束；
+   4) 用途：离线 ffprobe/ffmpeg 解码定界“拉流问题 vs 解码渲染问题”。
+2、PacketQueue 高水位受控丢包：
+   1) 队列超过 4MB/500 包水位后：丢弃后续非关键帧，关键帧到达则清队从 IDR 干净重启；
+   2) 防止解码/渲染停滞时网络包无界堆积导致 OOM。
+3、平滑优先渲染：
+   1) FrameQueue 12→8 帧、FramePool 14→10；
+   2) 显示延迟预算 66ms：健康 IDR 空档（84~148ms，IDR 序列化的固有代价）大部分被存货+预算吸收；
+   3) 自适应丢帧水位重标定 6/7、首帧攒帧再出。
+4、新增 docs/ 分析文档：TCP卡顿与UDP流畅分析、拉流到显示全链路分析、RTSP抓包分析指南。
+1111:
+1、CSV 末列新增 recv_time（本地墙钟 YYYY-MM-DD HH:MM:SS.mmm），可与 logcat 时间轴对齐；
+2、recv_us 保持单调钟不变，超时保护与统计逻辑零影响；
+3、三份分析文档归档至 docs/ 并推送。
